@@ -67,7 +67,7 @@ async def list_schedules(
 async def create_schedule(
     agent_id: uuid.UUID,
     data: ScheduleCreate,
-    current_user: User = Depends(require_role("platform_admin", "org_admin", "agent_admin")),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new schedule for an agent."""

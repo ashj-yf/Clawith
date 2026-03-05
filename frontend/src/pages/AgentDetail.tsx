@@ -603,6 +603,10 @@ export default function AgentDetail() {
             setShowScheduleForm(false);
             setSchedForm({ name: '', instruction: '', schedule: JSON.stringify(schedDefaults), due_date: '' });
         },
+        onError: (err: any) => {
+            const msg = err?.detail || err?.message || String(err);
+            alert(`Failed to create schedule: ${msg}`);
+        },
     });
 
     const toggleScheduleMut = useMutation({
@@ -1110,8 +1114,10 @@ export default function AgentDetail() {
 
                                         <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
                                             <button className="btn btn-secondary" onClick={() => setShowScheduleForm(false)}>{t('common.cancel')}</button>
-                                            <button className="btn btn-primary" disabled={!schedForm.name || !schedForm.instruction}
-                                                onClick={() => createScheduleMut.mutate()}>{t('agent.tasks.addSchedule')}</button>
+                                            <button className="btn btn-primary" disabled={!schedForm.name || !schedForm.instruction || createScheduleMut.isPending}
+                                                onClick={() => createScheduleMut.mutate()}>
+                                                {createScheduleMut.isPending ? '⏳ Saving...' : t('agent.tasks.addSchedule')}
+                                            </button>
                                         </div>
                                     </div>
                                 </div>
