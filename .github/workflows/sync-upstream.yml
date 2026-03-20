@@ -1,0 +1,66 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每天 UTC 时间 0:00 和 12:00 各执行一次 (北京时间 8:00 和 20:00)
+    - cron: '0 0,12 * * *'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史，便于合并
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add Upstream Remote
+        run: |
+          # 上游仓库地址 (根据需要修改)
+          git remote add upstream https://github.com/dataelement/Clawith.git || git remote set-url upstream https://github.com/dataelement/Clawith.git
+          git fetch upstream
+
+      - name: Sync with Upstream
+        run: |
+          # 获取当前分支名
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "Current branch: $CURRENT_BRANCH"
+
+          # 尝试合并上游的对应分支
+          git merge upstream/$CURRENT_BRANCH --no-edit
+
+          # 检查是否有冲突
+          if git diff --check; then
+            echo "✅ 合并成功，无冲突"
+          else
+            echo "⚠️ 存在冲突，请手动解决"
+            exit 1
+          fi
+
+      - name: Push Changes
+        run: |
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git push origin $CURRENT_BRANCH
+          echo "✅ 已推送到 origin/$CURRENT_BRANCH"
+
+      - name: Create Issue on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = process.env.GITHUB_REF_NAME;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `⚠️ Sync Upstream Failed on ${branch}`,
+              body: `自动同步上游仓库失败，请手动检查并解决冲突。\n\n分支: ${branch}\n时间: ${new Date().toISOString()}\n\n[查看运行日志](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              labels: ['sync', 'upstream']
+            });
