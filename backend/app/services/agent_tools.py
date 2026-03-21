@@ -2836,13 +2836,23 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 timeout=120.0,
             )
             try:
+                import asyncio
+                import httpx
                 for _round in range(max_tool_rounds):
-                    response = await llm_client.complete(
-                        messages=full_msgs,
-                        tools=tools_for_llm if tools_for_llm else None,
-                        temperature=0.7,
-                        max_tokens=4096,
-                    )
+                    # Retry up to 3 times on transient LLM timeouts before aborting
+                    for _attempt in range(3):
+                        try:
+                            response = await llm_client.complete(
+                                messages=full_msgs,
+                                tools=tools_for_llm if tools_for_llm else None,
+                                temperature=0.7,
+                                max_tokens=4096,
+                            )
+                            break
+                        except httpx.ReadTimeout:
+                            if _attempt == 2:
+                                raise
+                            await asyncio.sleep(2 ** _attempt)  # 1s, then 2s
 
                     # Track tokens from API response
                     real_tokens = extract_usage_tokens(response.usage)
@@ -2954,7 +2964,8 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return f"❌ Message send error: {str(e)[:200]}"
+        err_detail = str(e) or type(e).__name__
+        return f"❌ Message send error: {err_detail[:200]}"
 
 
 
@@ -4940,19 +4951,20 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     except Exception as e:
         return f"Failed to publish: {e}"
 
-    # Build public URL — use only scheme+host from public_base_url (strip any path)
+    # Build public URL using configured PUBLIC_BASE_URL
     public_base = ""
     try:
-        from urllib.parse import urlparse
         from app.models.system_settings import SystemSetting
-        async with async_session() as db:
-            r = await db.execute(
+        async with async_session() as db2:
+            r = await db2.execute(
                 select(SystemSetting).where(SystemSetting.key == "platform")
             )
             setting = r.scalar_one_or_none()
             if setting and setting.value and setting.value.get("public_base_url"):
-                parsed = urlparse(setting.value["public_base_url"])
-                public_base = f"{parsed.scheme}://{parsed.netloc}"
+                raw = setting.value["public_base_url"].strip().rstrip("/")
+                if raw and not raw.startswith("http"):
+                    raw = f"https://{raw}"
+                public_base = raw
     except Exception:
         pass
 
