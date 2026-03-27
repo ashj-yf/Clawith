@@ -497,7 +497,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_code",
-            "description": "Execute code (Python, Bash, or Node.js) in a sandboxed environment within the agent's workspace directory. Useful for data processing, calculations, file transformations, and automation scripts. Code runs with the workspace as the working directory. Security restrictions apply: no network access commands, no system-level operations, 30-second timeout.",
+            "description": "Execute code (Python, Bash, or Node.js) in a sandboxed environment within the agent's root directory. Useful for data processing, calculations, file transformations, and automation scripts. Code runs with the agent root as the working directory, so you can access skills/, workspace/, memory/ etc. directly. Security restrictions apply: no network access commands, no system-level operations, 30-second timeout.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -508,7 +508,7 @@ AGENT_TOOLS = [
                     },
                     "code": {
                         "type": "string",
-                        "description": "Code to execute. For Python, you can import standard libraries (json, csv, math, re, collections, etc.). Working directory is your workspace/.",
+                        "description": "Code to execute. For Python, you can import standard libraries (json, csv, math, re, collections, etc.). Working directory is the agent root (skills/, workspace/, memory/ are accessible).",
                     },
                     "timeout": {
                         "type": "integer",
@@ -1020,7 +1020,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "agentbay_browser_navigate",
-            "description": "使用 AgentBay 浏览器环境访问指定 URL。可用于网页抓取、截图等。需要先配置 AgentBay 通道。",
+            "description": "使用 AgentBay 浏览器环境访问指定 URL。可用于网页抓取、截图等。需要先配置 AgentBay 通道。Tip: after navigating, use browser_observe to identify elements, then browser_type/browser_click to interact. IMPORTANT: Do NOT call navigate again after clicking or typing just to take a screenshot — that will refresh the page and lose all your progress. Use agentbay_browser_screenshot instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1035,12 +1035,23 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "agentbay_browser_screenshot",
+            "description": "Take a screenshot of the CURRENT browser page without navigating anywhere. Use this after clicking, typing, or submitting a form to verify the result — it preserves the current page state. Never call browser_navigate just to take a screenshot.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "agentbay_browser_click",
-            "description": "在 AgentBay 浏览器中点击指定元素。需要先使用 browser_navigate 打开页面。",
+            "description": "在 AgentBay 浏览器中点击指定元素。selector 可以是 CSS 选择器（如 #btn）或自然语言描述（如 'the Send button' 或 '发送验证码按钮'）。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "selector": {"type": "string", "description": "CSS 选择器，如 #button 或 .class"},
+                    "selector": {"type": "string", "description": "CSS selector (e.g. #button) or natural language description of the element (e.g. 'the blue Submit button')"},
                 },
                 "required": ["selector"],
             },
@@ -1050,11 +1061,11 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "agentbay_browser_type",
-            "description": "在 AgentBay 浏览器的输入框中输入文本。需要先使用 browser_navigate 打开页面。",
+            "description": "在 AgentBay 浏览器的输入框中输入文本。selector 可以是 CSS 选择器或自然语言描述（如 'phone number input' 或 '手机号输入框'）。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "selector": {"type": "string", "description": "输入框的 CSS 选择器"},
+                    "selector": {"type": "string", "description": "CSS selector or natural language description of the input field (e.g. 'the phone number input' or 'input[type=tel]')"},
                     "text": {"type": "string", "description": "要输入的文本"},
                 },
                 "required": ["selector", "text"],
@@ -1476,6 +1487,8 @@ async def execute_tool(
         # ── AgentBay Tools ──
         elif tool_name == "agentbay_browser_navigate":
             result = await _agentbay_browser_navigate(agent_id, ws, arguments)
+        elif tool_name == "agentbay_browser_screenshot":
+            result = await _agentbay_browser_screenshot(agent_id, ws, arguments)
         elif tool_name == "agentbay_browser_click":
             result = await _agentbay_browser_click(agent_id, ws, arguments)
         elif tool_name == "agentbay_browser_type":
@@ -3867,8 +3880,9 @@ async def _execute_code(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict
     if language not in ("python", "bash", "node"):
         return f"❌ Unsupported language: {language}. Use: python, bash, or node"
 
-    # Working directory is the agent's workspace/ subdirectory (must be absolute)
-    work_dir = (ws / "workspace").resolve()
+    # Working directory is the agent's root directory (must be absolute)
+    # This allows code to access skills/, workspace/, memory/ etc. directly
+    work_dir = ws.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -3933,8 +3947,9 @@ async def _execute_code_legacy(ws: Path, arguments: dict) -> str:
     if safety_error:
         return safety_error
 
-    # Working directory is the agent's workspace/ subdirectory (must be absolute)
-    work_dir = (ws / "workspace").resolve()
+    # Working directory is the agent's root directory (must be absolute)
+    # This allows code to access skills/, workspace/, memory/ etc. directly
+    work_dir = ws.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine command and file extension
@@ -5827,6 +5842,49 @@ async def _agentbay_browser_navigate(agent_id: Optional[uuid.UUID], ws: Path, ar
     except Exception as e:
         logger.exception(f"[AgentBay] Browser navigate failed for agent {agent_id}")
         return f"❌ AgentBay 浏览器访问失败: {str(e)[:200]}"
+
+
+async def _agentbay_browser_screenshot(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+    """Take a screenshot of the current browser page without navigating.
+
+    This is the correct way to verify the result of a click, type, or form submit.
+    Do NOT call browser_navigate again just to take a screenshot — that refreshes the page.
+    """
+    if not agent_id:
+        return "❌ AgentBay 工具需要 agent 上下文"
+
+    from app.services.agentbay_client import get_agentbay_client_for_agent
+
+    try:
+        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        result = await client.browser_screenshot()
+
+        screenshot_data = result.get("screenshot")
+        if not screenshot_data:
+            return "❌ 截图失败：未返回图像数据"
+
+        import time, base64
+        rel_path = f"workspace/screenshot_{int(time.time())}.png"
+        screenshot_path = ws / rel_path
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(screenshot_data, str):
+            if screenshot_data.startswith("data:image"):
+                screenshot_data = screenshot_data.split(",", 1)[1]
+            screenshot_data = base64.b64decode(screenshot_data)
+        screenshot_path.write_bytes(screenshot_data)
+
+        return (
+            f"✅ 当前页面截图已保存至 `{rel_path}`。\n\n"
+            f"⚠️ 要在聊天框里向用户展示该截图，请必须在回复中包含以下原样 Markdown 语法：\n"
+            f"![浏览器截图](/api/agents/{agent_id}/files/download?path={rel_path})"
+        )
+
+    except RuntimeError as e:
+        return f"❌ {str(e)}"
+    except Exception as e:
+        logger.exception(f"[AgentBay] Browser screenshot failed for agent {agent_id}")
+        return f"❌ 截图失败: {str(e)[:200]}"
 
 
 async def _agentbay_browser_click(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:

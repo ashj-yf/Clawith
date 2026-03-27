@@ -104,12 +104,31 @@ class AgentBayClient:
         result = {"url": url, "success": True, "title": url}
 
         if screenshot:
+            # Wait for dynamic content and SPA rendering (React/Vue) before screenshotting
+            await asyncio.sleep(3)
             screenshot_data = await asyncio.to_thread(
                 self._session.browser.operator.screenshot, full_page=False
             )
             result["screenshot"] = screenshot_data
 
         return result
+
+    async def browser_screenshot(self) -> dict:
+        """Take a screenshot of the current browser page without navigating.
+
+        Use this after actions (click, type, form submit) to verify results
+        without refreshing the page. Never call browser_navigate just to screenshot.
+        """
+        await self._ensure_browser_initialized()
+        
+        # Wait for dynamic content and SPA rendering before screenshotting
+        await asyncio.sleep(3)
+        
+        screenshot_data = await asyncio.to_thread(
+            self._session.browser.operator.screenshot, full_page=False
+        )
+        return {"success": True, "screenshot": screenshot_data}
+
 
     async def browser_click(self, selector: str) -> dict:
         """Click element by CSS selector using SDK."""
@@ -159,6 +178,9 @@ class AgentBayClient:
     async def browser_extract(self, instruction: str, selector: str = "") -> dict:
         """Extract structured data from current page using natural language instruction."""
         await self._ensure_browser_initialized()
+        
+        # Wait for dynamic content and SPA rendering before extracting
+        await asyncio.sleep(3)
 
         from agentbay._common.models.browser_operator import ExtractOptions
         # Use a generic dict schema since we cannot define a Pydantic model at runtime
@@ -175,6 +197,9 @@ class AgentBayClient:
     async def browser_observe(self, instruction: str, selector: str = "") -> dict:
         """Observe the current page state and return interactive elements."""
         await self._ensure_browser_initialized()
+        
+        # Wait for dynamic content and SPA rendering before observing
+        await asyncio.sleep(3)
 
         from agentbay._common.models.browser_operator import ObserveOptions
         options = ObserveOptions(
@@ -221,6 +246,10 @@ class AgentBayClient:
     async def computer_screenshot(self) -> dict:
         """Take a screenshot of the desktop."""
         await self._ensure_computer_session()
+        
+        # Wait briefly for UI animations/rendering to settle
+        await asyncio.sleep(2)
+        
         result = await asyncio.to_thread(self._session.computer.screenshot)
         return {
             "success": result.success,
