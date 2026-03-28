@@ -364,8 +364,8 @@ async def call_llm(
                         "result": result,
                         "reasoning_content": full_reasoning_content
                     })
-                except Exception:
-                    pass
+                except Exception as _cb_err:
+                    logger.warning(f"[LLM] on_tool_call callback error: {_cb_err}")
 
             # ── Vision injection for screenshot tools ──
             # If the model supports vision, try to inject the actual screenshot
@@ -716,6 +716,9 @@ async def websocket_chat(
                         partial_chunks.append(text)
                         await websocket.send_json({"type": "chunk", "content": text})
                     
+                    # Track which agentbay live URLs have been sent to avoid redundant pushes
+                    _sent_live_envs: set[str] = set()
+
                     async def tool_call_to_ws(data: dict):
                         """Send tool call info to client and persist completed ones."""
                         await websocket.send_json({"type": "tool_call", **data})
@@ -741,6 +744,56 @@ async def websocket_chat(
                                     await _tc_db.commit()
                             except Exception as _tc_err:
                                 logger.warning(f"[WS] Failed to save tool_call: {_tc_err}")
+
+                            # ── AgentBay live preview push ──
+                            # Push real-time screenshots when AgentBay tools are used.
+                            # Note: get_link() (VNC) requires premium; we use screenshots instead.
+                            try:
+                                from app.services.agentbay_live import detect_agentbay_env, get_desktop_screenshot, get_browser_snapshot
+                                tool_name = data.get("name", "")
+                                logger.info(f"[WS][LivePreview] Checking tool: {tool_name}")
+                                env = detect_agentbay_env(tool_name)
+                                logger.info(f"[WS][LivePreview] Detected env: {env}")
+                                if env:
+                                    if env == "desktop":
+                                        # Send desktop screenshot after each computer action
+                                        logger.info(f"[WS][LivePreview] Getting desktop screenshot for agent {agent_id}")
+                                        snapshot = await get_desktop_screenshot(agent_id)
+                                        logger.info(f"[WS][LivePreview] Desktop snapshot result: {'got data (' + str(len(snapshot)) + ' chars)' if snapshot else 'None'}")
+                                        if snapshot:
+                                            await websocket.send_json({
+                                                "type": "agentbay_live",
+                                                "env": "desktop",
+                                                "screenshot": snapshot,
+                                            })
+                                            _sent_live_envs.add("desktop")
+                                            logger.info("[WS][LivePreview] Desktop screenshot sent!")
+
+                                    elif env == "browser":
+                                        # Send browser screenshot after each browser action
+                                        logger.info(f"[WS][LivePreview] Getting browser snapshot for agent {agent_id}")
+                                        snapshot = await get_browser_snapshot(agent_id)
+                                        logger.info(f"[WS][LivePreview] Browser snapshot result: {'got data' if snapshot else 'None'}")
+                                        if snapshot:
+                                            await websocket.send_json({
+                                                "type": "agentbay_live",
+                                                "env": "browser",
+                                                "screenshot": snapshot,
+                                            })
+                                            _sent_live_envs.add("browser")
+
+                                    elif env == "code":
+                                        # Send code output (already in tool result)
+                                        result_text = data.get("result", "")
+                                        if result_text:
+                                            await websocket.send_json({
+                                                "type": "agentbay_live",
+                                                "env": "code",
+                                                "output": result_text[:5000],
+                                            })
+                                            _sent_live_envs.add("code")
+                            except Exception as _live_err:
+                                logger.warning(f"[WS][LivePreview] Push FAILED: {_live_err}", exc_info=True)
                     
                     # Track thinking content for storage
                     thinking_content = []

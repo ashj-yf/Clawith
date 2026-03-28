@@ -1075,6 +1075,21 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "agentbay_browser_login",
+            "description": "Use AgentBay's AI-driven login skill to automate complex login flows (CAPTCHAs, OTP, multi-step auth). Requires a login_config JSON with AgentBay skill credentials. Navigate to the login page and execute the login skill.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The login page URL to navigate to"},
+                    "login_config": {"type": "string", "description": "JSON string with login config, e.g. '{\"api_key\": \"xxx\", \"skill_id\": \"yyy\"}'"},
+                },
+                "required": ["url", "login_config"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "agentbay_code_execute",
             "description": "在 AgentBay 代码空间中执行代码。支持 Python、Bash、Node.js。需要先配置 AgentBay 通道。",
             "parameters": {
@@ -1499,6 +1514,8 @@ async def execute_tool(
             result = await _agentbay_browser_extract(agent_id, ws, arguments)
         elif tool_name == "agentbay_browser_observe":
             result = await _agentbay_browser_observe(agent_id, ws, arguments)
+        elif tool_name == "agentbay_browser_login":
+            result = await _agentbay_browser_login(agent_id, ws, arguments)
         elif tool_name == "agentbay_command_exec":
             result = await _agentbay_command_exec(agent_id, ws, arguments)
         elif tool_name == "agentbay_computer_screenshot":
@@ -6211,6 +6228,41 @@ async def _agentbay_browser_observe(agent_id: Optional[uuid.UUID], ws: Path, arg
 
 # ─── AgentBay: Command (Shell) ──────────────────────────────────────────
 
+async def _agentbay_browser_login(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+    """Perform an automated login using AgentBay's built-in login skill.
+
+    Supports complex login flows including CAPTCHAs, OTP inputs,
+    and multi-step authentication via AgentBay's AI-driven capability.
+    """
+    if not agent_id:
+        return "AgentBay tools require agent context"
+
+    from app.services.agentbay_client import get_agentbay_client_for_agent
+
+    url = arguments.get("url", "")
+    login_config = arguments.get("login_config", "")
+
+    if not url.strip():
+        return "Missing required argument 'url'"
+    if not login_config.strip():
+        return "Missing required argument 'login_config' (JSON string with api_key + skill_id)"
+
+    try:
+        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        result = await client.browser_login(url, login_config)
+
+        if result.get("success"):
+            return f"Login completed successfully. {result.get('message', '')}"
+        else:
+            return f"Login failed: {result.get('message', 'Unknown error')}"
+
+    except RuntimeError as e:
+        return f"{str(e)}. Please configure AgentBay in Agent settings."
+    except Exception as e:
+        logger.exception(f"[AgentBay] Browser login failed for agent {agent_id}")
+        return f"Login failed: {str(e)[:200]}"
+
+
 async def _agentbay_command_exec(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
     """Execute a shell command in the AgentBay environment."""
     if not agent_id:
@@ -6261,7 +6313,7 @@ def _save_screenshot_to_workspace(agent_id: uuid.UUID, ws: Path, data) -> str:
     import time
     import base64
 
-    rel_path = f"workspace/desktop_screenshot_{int(time.time())}.png"
+    rel_path = f"workspace/desktop-screenshot-{int(time.time())}.png"
     screenshot_path = ws / rel_path
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -6498,10 +6550,18 @@ async def _agentbay_computer_start_app(agent_id: Optional[uuid.UUID], ws: Path, 
         client = await get_agentbay_client_for_agent(agent_id, "computer")
         result = await client.computer_start_app(cmd, work_dir=work_dir)
         if result.get("success"):
-            import json
+            # result.data may contain non-serializable objects (e.g. Process),
+            # so convert to string safely instead of json.dumps()
             data = result.get("data")
-            data_str = json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, (dict, list)) else str(data or "")
-            return f"Application started: {cmd}\n\n{data_str[:1000]}" if data_str else f"Application started: {cmd}"
+            if data is not None:
+                try:
+                    import json
+                    data_str = json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, (dict, list, str, int, float, bool)) else str(data)
+                except (TypeError, ValueError):
+                    data_str = str(data)
+            else:
+                data_str = ""
+            return f"Application started: {cmd}" + (f"\n\n{data_str[:1000]}" if data_str else "")
         return f"Failed to start application: {result.get('error_message', 'Unknown error')}"
     except RuntimeError as e:
         return f"{str(e)}"
