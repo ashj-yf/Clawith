@@ -19,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.identity import IdentityProvider
 from app.models.org import OrgDepartment, OrgMember
 from app.models.user import User
+from pypinyin import pinyin, Style
+
 from app.core.security import hash_password
 
 
@@ -160,7 +162,11 @@ class BaseOrgSyncAdapter(ABC):
                 for user in users:
                     try:
                         async with db.begin_nested():
-                            await self._upsert_member(db, provider, user, dept.external_id)
+                            stats = await self._upsert_member(db, provider, user, dept.external_id)
+                            if stats.get("user_created"):
+                                user_count += 1
+                            if stats.get("profile_synced"):
+                                profile_count += 1
                         member_count += 1
                     except Exception as e:
                         logger.error(f"[OrgSync] Failed to sync member {user.external_id} ({user.name}): {e}")
@@ -218,7 +224,7 @@ class BaseOrgSyncAdapter(ABC):
         )
 
     async def _update_member_counts(self, db: AsyncSession, provider_id: uuid.UUID):
-        """Update member_count for all departments. Root shows total, others show direct."""
+        """Update member_count for all departments to include all their recursive sub-department members."""
         from sqlalchemy import update, select, func
 
         # 1. Update all departments to show their DIRECT member counts
@@ -236,21 +242,53 @@ class BaseOrgSyncAdapter(ABC):
             .values(member_count=direct_subquery)
         )
 
-        # 2. Update the Root department(s) (parent_id is NULL) to show the TOTAL provider headcount
-        total_subquery = (
-            select(func.count(OrgMember.id))
-            .where(OrgMember.provider_id == provider_id)
-            .where(OrgMember.status == "active")
-            .scalar_subquery()
-        )
-
-        await db.execute(
-            update(OrgDepartment)
+        # 2. Fetch all active departments to compute recursive aggregated counts
+        result = await db.execute(
+            select(OrgDepartment.id, OrgDepartment.parent_id, OrgDepartment.member_count)
             .where(OrgDepartment.provider_id == provider_id)
-            .where(OrgDepartment.parent_id.is_(None))
             .where(OrgDepartment.status == "active")
-            .values(member_count=total_subquery)
         )
+        rows = result.all()
+        
+        # Build tree structure and lookup
+        dept_map = {row.id: {"parent_id": row.parent_id, "direct": row.member_count, "total": 0, "children": []} for row in rows}
+        root_ids = []
+        for d_id, d_data in dept_map.items():
+            parent_id = d_data["parent_id"]
+            if parent_id and parent_id in dept_map:
+                dept_map[parent_id]["children"].append(d_id)
+            else:
+                root_ids.append(d_id)
+                
+        # Recursive function to calculate total
+        def compute_total(node_id):
+            node = dept_map[node_id]
+            total = node["direct"]
+            for child_id in node["children"]:
+                total += compute_total(child_id)
+            node["total"] = total
+            return total
+            
+        for root_id in root_ids:
+            compute_total(root_id)
+            
+        # 3. Bulk update all departments with their aggregated total counts
+        # Skip if no updates needed to avoid unnecessary writes, but usually it's fast enough
+        update_mappings = [{"id": d_id, "member_count": d_data["total"]} for d_id, d_data in dept_map.items()]
+        
+        if update_mappings:
+            from app.database import async_engine
+            # Use core update with executemany approach handled cleanly by SQLAlchemy mapping
+            # SQLAlchemy 2.0 style bulk update
+            from sqlalchemy import bindparam
+            stmt = (
+                update(OrgDepartment)
+                .where(OrgDepartment.id == bindparam("b_id"))
+                .values(member_count=bindparam("b_count"))
+            )
+            # Re-map keys for bindparams
+            bind_mappings = [{"b_id": m["id"], "b_count": m["member_count"]} for m in update_mappings]
+            await db.execute(stmt, bind_mappings)
 
     async def _ensure_provider(self, db: AsyncSession) -> IdentityProvider:
         """Ensure IdentityProvider record exists."""
@@ -418,6 +456,10 @@ class BaseOrgSyncAdapter(ABC):
         # Update/Create OrgMember
         if existing_member:
             existing_member.name = user.name
+            # Generate transliteration
+            existing_member.name_translit_full = "".join([i[0] for i in pinyin(user.name, style=Style.NORMAL)])
+            existing_member.name_translit_initial = "".join([i[0] for i in pinyin(user.name, style=Style.FIRST_LETTER)])
+            
             if email is not None:
                 existing_member.email = email
             existing_member.avatar_url = user.avatar_url
@@ -436,7 +478,11 @@ class BaseOrgSyncAdapter(ABC):
             existing_member.synced_at = now
             if user_id and not existing_member.user_id:
                 existing_member.user_id = user_id
+            stats["profile_synced"] = True
         else:
+            translit_full = "".join([i[0] for i in pinyin(user.name, style=Style.NORMAL)])
+            translit_initial = "".join([i[0] for i in pinyin(user.name, style=Style.FIRST_LETTER)])
+            
             new_member = OrgMember(
                 external_id=user.external_id,
                 open_id=user.open_id,
@@ -444,6 +490,8 @@ class BaseOrgSyncAdapter(ABC):
                 provider_id=provider.id,
                 user_id=user_id,
                 name=user.name,
+                name_translit_full=translit_full,
+                name_translit_initial=translit_initial,
                 email=email,
                 avatar_url=user.avatar_url,
                 title=user.title,
@@ -455,6 +503,7 @@ class BaseOrgSyncAdapter(ABC):
                 synced_at=now,
             )
             db.add(new_member)
+            stats["profile_synced"] = True
 
         # Sync email/phone from OrgMember to User (if linked)
         target_user = platform_user
@@ -523,7 +572,8 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
             return data.get("tenant_access_token") or data.get("app_access_token") or ""
 
     async def fetch_departments(self) -> list[ExternalDepartment]:
-        """Fetch all departments from Feishu using paged list API to get full metadata."""
+        """Fetch all departments from Feishu using concurrent recursive calls to get parent-child relationships."""
+        import asyncio
         token = await self.get_access_token()
         all_depts: list[ExternalDepartment] = []
         # Add a virtual root for the tenant, consistent with DingTalk root behavior
@@ -536,53 +586,63 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                 raw_data={"department_id": "0", "name": "Root"}
             )
         )
-        page_token = ""
         
         async with httpx.AsyncClient() as client:
-            while True:
-                # The departments list API with fetch_child=true is the most efficient 
-                # way to get the entire tree with full metadata (names, counts).
-                params = {
-                    "department_id_type": "open_department_id",
-                    "fetch_child": "true",
-                    "page_size": "50",
-                }
-                if page_token:
-                    params["page_token"] = page_token
+            sem = asyncio.Semaphore(15)  # Limit concurrent requests to avoid rate limits
+            
+            async def fetch_children(parent_id: str):
+                page_token = ""
+                tasks = []
+                while True:
+                    params = {
+                        "department_id_type": "open_department_id",
+                        "fetch_child": "false",
+                        "page_size": "50",
+                    }
+                    if page_token:
+                        params["page_token"] = page_token
 
-                resp = await client.get(
-                    self.FEISHU_DEPT_URL + "/0/children", 
-                    params=params, 
-                    headers={"Authorization": f"Bearer {token}"}
-                )
-                data = resp.json()
+                    async with sem:
+                        resp = await client.get(
+                            f"{self.FEISHU_DEPT_URL}/{parent_id}/children", 
+                            params=params, 
+                            headers={"Authorization": f"Bearer {token}"}
+                        )
+                    data = resp.json()
 
-                if data.get("code") != 0:
-                    logger.error(f"Feishu fetch departments list error: {data}")
-                    break
+                    if data.get("code") != 0:
+                        logger.error(f"Feishu fetch departments list error for parent {parent_id}: {data}")
+                        break
 
-                res_data = data.get("data", {})
-                items = res_data.get("items", []) or []
-                for item in items:
-                    dept_id = item.get("open_department_id")
-                    if not dept_id: continue
-                    
-                    raw_parent = item.get("parent_department_id")
-                    # Any department whose parent is 0 or null is a child of our virtual Root
-                    parent_external = raw_parent if raw_parent and raw_parent != "0" else "0"
-                    
-                    dept = ExternalDepartment(
-                        external_id=dept_id,
-                        name=item.get("name", ""),
-                        parent_external_id=parent_external,
-                        member_count=item.get("member_count", 0),
-                        raw_data=item,
-                    )
-                    all_depts.append(dept)
+                    res_data = data.get("data", {})
+                    items = res_data.get("items", []) or []
+                    for item in items:
+                        dept_id = item.get("open_department_id")
+                        if not dept_id: continue
+                        
+                        # Since we fetched using parent_id, we intrinsically know the parent!
+                        parent_external = parent_id if parent_id and parent_id != "0" else "0"
+                        
+                        dept = ExternalDepartment(
+                            external_id=dept_id,
+                            name=item.get("name", ""),
+                            parent_external_id=parent_external,
+                            member_count=item.get("member_count", 0),
+                            raw_data=item,
+                        )
+                        all_depts.append(dept)
+                        
+                        # Recursively fetch children for this department
+                        tasks.append(fetch_children(dept_id))
 
-                page_token = res_data.get("page_token", "")
-                if not page_token:
-                    break
+                    page_token = res_data.get("page_token", "")
+                    if not page_token:
+                        break
+                        
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+            await fetch_children("0")
                         
         logger.info(f"Feishu fetched {len(all_depts)} departments total.")
         return all_depts
@@ -845,7 +905,9 @@ class WeComOrgSyncAdapter(BaseOrgSyncAdapter):
         super().__init__(provider, config, tenant_id)
         # Handle various config key naming conventions
         self.corp_id = self.config.get("corp_id") or self.config.get("app_id") or self.config.get("corpid")
-        self.secret = self.config.get("secret") or self.config.get("app_secret") or self.config.get("corpsecret")
+        self.secret = self.config.get("secret") or self.config.get("app_secret") or self.config.get("corpsecret") or self.config.get("bot_secret")
+        self.bot_id = self.config.get("bot_id")
+        self.bot_secret = self.config.get("bot_secret") or self.secret
         self._access_token: str | None = None
         self._token_expires_at: datetime | None = None
 
@@ -858,24 +920,39 @@ class WeComOrgSyncAdapter(BaseOrgSyncAdapter):
         if self._access_token and self._token_expires_at and datetime.now() < self._token_expires_at:
             return self._access_token
 
-        if not self.corp_id or not self.secret:
-            raise ValueError("WeCom corp_id/secret missing in provider config")
+        # Priority 1: Standard CorpID + Secret
+        if self.corp_id and self.secret:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    self.WECOM_TOKEN_URL,
+                    params={"corpid": self.corp_id, "corpsecret": self.secret},
+                )
+                data = resp.json()
+                if data.get("errcode") == 0:
+                    token = data.get("access_token") or ""
+                    expires_in = int(data.get("expires_in") or 7200)
+                    self._access_token = token
+                    self._token_expires_at = datetime.now() + timedelta(seconds=max(expires_in - 300, 300))
+                    return token
+                else:
+                    logger.error(f"[WeCom Sync] Token error with corp_id: {data}")
 
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                self.WECOM_TOKEN_URL,
-                params={"corpid": self.corp_id, "corpsecret": self.secret},
-            )
-            data = resp.json()
-            if data.get("errcode") != 0:
-                raise RuntimeError(f"WeCom token error: {data.get('errmsg') or data}")
-            
-            token = data.get("access_token") or ""
-            expires_in = int(data.get("expires_in") or 7200)
-            self._access_token = token
-            # Refresh a bit earlier (5 mins)
-            self._token_expires_at = datetime.now() + timedelta(seconds=max(expires_in - 300, 300))
-            return token
+        # Priority 2: Try bot_id as corp_id if no corp_id provided (fallback)
+        if not self.corp_id and self.bot_id and self.bot_secret:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    self.WECOM_TOKEN_URL,
+                    params={"corpid": self.bot_id, "corpsecret": self.bot_secret},
+                )
+                data = resp.json()
+                if data.get("errcode") == 0:
+                    token = data.get("access_token") or ""
+                    expires_in = int(data.get("expires_in") or 7200)
+                    self._access_token = token
+                    self._token_expires_at = datetime.now() + timedelta(seconds=max(expires_in - 300, 300))
+                    return token
+
+        raise ValueError("WeCom credentials (corp_id/secret or bot_id/secret) missing or invalid")
 
     async def fetch_departments(self) -> list[ExternalDepartment]:
         """Fetch all departments from WeCom."""

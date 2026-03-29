@@ -87,20 +87,17 @@ class SSOService:
 
         # Try to find tenant by custom domain
         result = await db.execute(
-            select(Tenant).where(Tenant.custom_domain.ilike(f"%{domain}%"))
+            select(Tenant).where(Tenant.sso_domain.ilike(f"%{domain}%"))
         )
         tenant = result.scalar_one_or_none()
 
         if tenant:
             return str(tenant.id)
 
-        # Try to find tenant by matching tenant name/domain
+        # Try to find tenant by matching tenant name
         result = await db.execute(
             select(Tenant).where(
-                or_(
-                    Tenant.name.ilike(f"%{domain.split('.')[0]}%"),
-                    Tenant.domain.ilike(f"%{domain}%"),
-                )
+                Tenant.name.ilike(f"%{domain.split('.')[0]}%")
             )
         )
         tenant = result.scalar_one_or_none()
@@ -141,6 +138,7 @@ class SSOService:
         # For Feishu/DingTalk we often use unionid, for WeCom we use external_id (userid)
         member_query = select(OrgMember).where(
             OrgMember.provider_id == provider.id,
+            OrgMember.status == "active",
             or_(
                 OrgMember.unionid == provider_user_id,
                 OrgMember.external_id == provider_user_id,
@@ -182,27 +180,21 @@ class SSOService:
         from app.models.org import OrgMember
 
         # Get or create provider
-        query = select(IdentityProvider).where(IdentityProvider.provider_type == provider_type)
-        if tenant_id:
-            query = query.where(IdentityProvider.tenant_id == tenant_id)
+        query = select(IdentityProvider).where(
+            IdentityProvider.provider_type == provider_type,
+            IdentityProvider.tenant_id == tenant_id
+        )
             
         result = await db.execute(query)
         provider = result.scalar_one_or_none()
 
         if not provider:
-            provider = IdentityProvider(
-                provider_type=provider_type,
-                name=provider_type.capitalize(),
-                is_active=True,
-                config={},
-                tenant_id=tenant_id,
-            )
-            db.add(provider)
-            await db.flush()
+            raise ValueError(f"Provider {provider_type} not found for tenant {tenant_id}")
 
-        # Check if OrgMember already exists
+        # Check if OrgMember already exists (only active members)
         member_query = select(OrgMember).where(
             OrgMember.provider_id == provider.id,
+            OrgMember.status == "active",
             or_(
                 OrgMember.unionid == provider_user_id,
                 OrgMember.external_id == provider_user_id,
@@ -217,8 +209,12 @@ class SSOService:
             member.user_id = uuid.UUID(user_id) if isinstance(user_id, str) else user_id
         else:
             # Create a shell OrgMember if not synced yet (though usually they should exist)
+            member_name = identity_data.get("name") if identity_data else None
+            if not member_name:
+                # Try to get name from user_info if passed differently
+                member_name = identity_data.get("display_name") if identity_data else None
             member = OrgMember(
-                name=identity_data.get("name") if identity_data else "Unknown",
+                name=member_name or f"{provider_type.capitalize()} User {provider_user_id[:8]}",
                 email=identity_data.get("email") if identity_data else None,
                 provider_id=provider.id,
                 user_id=uuid.UUID(user_id) if isinstance(user_id, str) else user_id,

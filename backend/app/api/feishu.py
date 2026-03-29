@@ -48,7 +48,6 @@ async def feishu_oauth_callback(
         # Use FeishuAuthProvider instead of legacy feishu_service
         from app.services.auth_provider import FeishuAuthProvider
         from app.models.identity import IdentityProvider
-        from sqlalchemy import select
         from app.config import get_settings
 
         # Get Feishu credentials from settings
@@ -498,7 +497,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 IdentityProvider.tenant_id == (agent_obj.tenant_id if agent_obj else None)
             )
             provider_result = await db.execute(provider_query)
-            provider = provider_result.scalar_one_or_none()
+            provider = provider_result.scalars().first()
             
             if not provider:
                 provider = IdentityProvider(
@@ -516,7 +515,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             if sender_user_id_feishu or sender_open_id:
                 member_query = select(OrgMember).where(
                     OrgMember.provider_id == provider.id,
-                    OrgMember.tenant_id == tenant_uuid,
+                    OrgMember.tenant_id == agent_obj.tenant_id if agent_obj else None,
+                    OrgMember.status == "active",
                     or_(
                         OrgMember.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
                         OrgMember.open_id == sender_open_id if sender_open_id else False,
@@ -524,7 +524,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     )
                 )
                 member_result = await db.execute(member_query)
-                member = member_result.scalar_one_or_none()
+                member = member_result.scalars().first()
                 if member and member.user_id:
                     platform_user_id = member.user_id
                     logger.info(f"[Feishu] Matched user via OrgMember: {platform_user_id}")
@@ -533,33 +533,43 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             if platform_user_id == creator_id and sender_name:
                 from app.core.security import hash_password
                 new_username = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
-                new_user = User(
-                    username=new_username,
-                    email=f"{new_username}@feishu.local",
-                    password_hash=hash_password(_uuid.uuid4().hex),  # random password
-                    display_name=sender_name,
-                    role="member",
-                    external_id=sender_user_id_feishu,
-                    feishu_user_id=sender_user_id_feishu or None,
-                    tenant_id=agent_obj.tenant_id if agent_obj else None,
-                )
-                db.add(new_user)
-                await db.flush()
-                platform_user_id = new_user.id
-                logger.info(f"[Feishu] Auto-created user: {sender_name} -> {new_username}")
                 
+                # Check if a user with this username already exists
+                existing_user_query = select(User).where(User.username == new_username)
+                existing_user_result = await db.execute(existing_user_query)
+                existing_user = existing_user_result.scalars().first()
+                
+                if existing_user:
+                    platform_user_id = existing_user.id
+                    logger.info(f"[Feishu] Found existing user by username: {new_username}")
+                else:
+                    new_user = User(
+                        username=new_username,
+                        email=f"{new_username}@feishu.local",
+                        password_hash=hash_password(_uuid.uuid4().hex),  # random password
+                        display_name=sender_name,
+                        role="member",
+                        external_id=sender_user_id_feishu,
+                        feishu_user_id=sender_user_id_feishu or None,
+                        tenant_id=agent_obj.tenant_id if agent_obj else None,
+                    )
+                    db.add(new_user)
+                    await db.flush()
+                    platform_user_id = new_user.id
+                    logger.info(f"[Feishu] Auto-created user: {sender_name} -> {new_username}")
             # Ensure OrgMember exists and is linked
             member_check = await db.execute(
                 select(OrgMember).where(
                     OrgMember.provider_id == provider.id,
-                    OrgMember.tenant_id == tenant_uuid,
+                    OrgMember.tenant_id == agent_obj.tenant_id if agent_obj else None,
+                    OrgMember.status == "active",
                     or_(
                         OrgMember.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
                         OrgMember.open_id == sender_open_id if sender_open_id else False
                     )
                 )
             )
-            member = member_check.scalar_one_or_none()
+            member = member_check.scalars().first()
             if not member:
                 member = OrgMember(
                     name=sender_name or f"Feishu User {sender_open_id[:8]}",
@@ -959,29 +969,30 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
                     IdentityProviderModel.tenant_id == agent_obj.tenant_id,
                 )
             )
-            _provider = _pr.scalar_one_or_none()
+            _provider = _pr.scalars().first()
             if _provider and (sender_user_id_feishu or sender_open_id):
                 _mr = await db.execute(
                     _select(OrgMemberModel).where(
                         OrgMemberModel.provider_id == _provider.id,
                         OrgMemberModel.tenant_id == agent_obj.tenant_id,
+                        OrgMemberModel.status == "active",
                         or_(
                             OrgMemberModel.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
                             OrgMemberModel.open_id == sender_open_id if sender_open_id else False,
                         )
                     )
                 )
-                _member = _mr.scalar_one_or_none()
+                _member = _mr.scalars().first()
                 if _member and _member.user_id:
                     _ur = await db.execute(_select(UserModel).where(UserModel.id == _member.user_id))
-                    _pu = _ur.scalar_one_or_none()
+                    _pu = _ur.scalars().first()
         if sender_user_id_feishu:
             _ur = await db.execute(_select(UserModel).where(UserModel.feishu_user_id == sender_user_id_feishu))
-            _pu = _ur.scalar_one_or_none()
+            _pu = _ur.scalars().first()
         if not _pu:
             _un = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
             _ur = await db.execute(_select(UserModel).where(UserModel.username == _un))
-            _pu = _ur.scalar_one_or_none()
+            _pu = _ur.scalars().first()
         if not _pu:
             _un = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
             _pu = UserModel(
