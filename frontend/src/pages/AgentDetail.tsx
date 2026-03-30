@@ -49,7 +49,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
     const [configData, setConfigData] = useState<Record<string, any>>({});
     const [configJson, setConfigJson] = useState('');
     const [configSaving, setConfigSaving] = useState(false);
-    const [toolTab, setToolTab] = useState<'platform' | 'company' | 'installed'>('platform');
+    const [toolTab, setToolTab] = useState<'company' | 'installed'>('company');
     const [deletingToolId, setDeletingToolId] = useState<string | null>(null);
     const [configCategory, setConfigCategory] = useState<string | null>(null);
 
@@ -153,8 +153,8 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
 
     if (loading) return <div style={{ color: 'var(--text-tertiary)', padding: '20px' }}>{t('common.loading')}</div>;
 
-    const systemTools = tools.filter(t => t.source === 'builtin');
-    const companyTools = tools.filter(t => t.source === 'admin');
+    // Company tools = platform presets (builtin) + company admin-added tools (admin)
+    const companyTools = tools.filter(t => t.source === 'builtin' || t.source === 'admin');
     const agentInstalledTools = tools.filter(t => t.source === 'agent');
 
     const groupByCategory = (toolList: any[]) =>
@@ -299,25 +299,12 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
             </div>
         ));
 
-    const activeTools = toolTab === 'platform' ? systemTools : (toolTab === 'company' ? companyTools : agentInstalledTools);
+    const activeTools = toolTab === 'company' ? companyTools : agentInstalledTools;
 
     return (
         <>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                {/* Tab Bar */}
-                <div style={{ display: 'flex', gap: '2px', background: 'var(--bg-tertiary)', borderRadius: '8px', padding: '3px' }}>
-                    <button
-                        onClick={() => setToolTab('platform')}
-                        style={{
-                            flex: 1, padding: '7px 12px', border: 'none', borderRadius: '6px', cursor: 'pointer',
-                            fontSize: '12px', fontWeight: 600, transition: 'all 0.2s',
-                            background: toolTab === 'platform' ? 'var(--bg-primary)' : 'transparent',
-                            color: toolTab === 'platform' ? 'var(--text-primary)' : 'var(--text-tertiary)',
-                            boxShadow: toolTab === 'platform' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
-                        }}
-                    >
-                        🔧 {t('agent.tools.platformTools', 'Platform Tools')} ({systemTools.length})
-                    </button>
+                <div style={{ display: 'flex', gap: '4px', padding: '4px', background: 'var(--bg-secondary)', borderRadius: '8px', marginBottom: '12px' }}>
                     <button
                         onClick={() => setToolTab('company')}
                         style={{
@@ -328,7 +315,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                             boxShadow: toolTab === 'company' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
                         }}
                     >
-                        🏢 {t('agent.tools.companyTools', 'Company Tools')} ({companyTools.length})
+                        {t('agent.tools.companyTools', 'Company Tools')} ({companyTools.length})
                     </button>
                     <button
                         onClick={() => setToolTab('installed')}
@@ -340,7 +327,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                             boxShadow: toolTab === 'installed' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
                         }}
                     >
-                        🤖 {t('agent.tools.agentInstalled', 'Agent-Installed Tools')} ({agentInstalledTools.length})
+                        {t('agent.tools.agentInstalled', 'Agent Self-Installed Tools')} ({agentInstalledTools.length})
                     </button>
                 </div>
 
@@ -349,7 +336,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                     renderToolGroup(groupByCategory(activeTools))
                 ) : (
                     <div className="card" style={{ textAlign: 'center', padding: '30px', color: 'var(--text-tertiary)' }}>
-                        {toolTab === 'installed' ? t('agent.tools.noInstalled', 'No agent-installed tools yet') : (toolTab === 'company' ? t('agent.tools.noCompany', 'No company-configured tools') : t('common.noData'))}
+                        {toolTab === 'installed' ? t('agent.tools.noInstalled', 'No agent-installed tools yet') : t('agent.tools.noCompany', 'No company-configured tools')}
                     </div>
                 )}
             </div>
@@ -1222,7 +1209,7 @@ function AgentDetailInner() {
     const wsRef = useRef<WebSocket | null>(null);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const chatContainerRef = useRef<HTMLDivElement>(null);
-    const chatInputRef = useRef<HTMLInputElement>(null);
+    const chatInputRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     // Settings form local state
@@ -1635,12 +1622,13 @@ function AgentDetailInner() {
         }
     }, [chatMessages]);
 
-    // Auto-focus input when switching sessions
+    // Auto-focus input when switching sessions and connection is ready
     useEffect(() => {
-        if (activeSession && activeTab === 'chat') {
-            setTimeout(() => chatInputRef.current?.focus(), 150);
+        if (activeSession && activeTab === 'chat' && wsConnected) {
+            // Tiny timeout to ensure React has enabled the textarea before focusing
+            setTimeout(() => chatInputRef.current?.focus(), 50);
         }
-    }, [activeSession?.id, activeTab]);
+    }, [activeSession?.id, activeTab, wsConnected]);
 
     const sendChatMsg = () => {
         if (!id || !activeSession?.id) return;
@@ -1698,6 +1686,12 @@ function AgentDetailInner() {
         }));
 
         setChatInput('');
+        // Reset textarea height to single line after sending
+        requestAnimationFrame(() => {
+            if (chatInputRef.current) {
+                chatInputRef.current.style.height = 'auto';
+            }
+        });
         setAttachedFiles([]);
     };
 
@@ -3687,11 +3681,41 @@ function AgentDetailInner() {
                                                     <button onClick={() => { uploadAbortRef.current?.(); }} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: '12px', padding: '0 2px', lineHeight: 1 }} title="Cancel upload">✕</button>
                                                 </div>
                                             )}
-                                            <input ref={chatInputRef} className="chat-input" value={chatInput} onChange={e => setChatInput(e.target.value)}
-                                                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isWaiting && !isStreaming) { e.preventDefault(); sendChatMsg(); } }}
+                                            <textarea
+                                                ref={chatInputRef}
+                                                className="chat-input"
+                                                value={chatInput}
+                                                onChange={e => {
+                                                    setChatInput(e.target.value);
+                                                    // Auto-resize: reset then expand up to ~5 lines (130px)
+                                                    requestAnimationFrame(() => {
+                                                        const el = chatInputRef.current;
+                                                        if (!el) return;
+                                                        el.style.height = 'auto';
+                                                        el.style.height = Math.min(el.scrollHeight, 130) + 'px';
+                                                    });
+                                                }}
+                                                onKeyDown={e => {
+                                                    // Ctrl+Enter (or Cmd+Enter on Mac) sends; plain Enter inserts newline
+                                                    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing && !isWaiting && !isStreaming) {
+                                                        e.preventDefault();
+                                                        sendChatMsg();
+                                                    }
+                                                }}
                                                 onPaste={handlePaste}
                                                 placeholder={!wsConnected && (!activeSession?.user_id || !currentUser || activeSession.user_id === String(currentUser?.id)) ? 'Connecting...' : attachedFiles.length > 0 ? t('agent.chat.askAboutFile', { name: attachedFiles.length === 1 ? attachedFiles[0].name : `${attachedFiles.length} files` }) : t('chat.placeholder')}
-                                                disabled={!wsConnected} style={{ flex: 1 }} autoFocus />
+                                                disabled={!wsConnected}
+                                                rows={1}
+                                                style={{
+                                                    flex: 1,
+                                                    resize: 'none',
+                                                    overflow: 'hidden',
+                                                    lineHeight: '22px',
+                                                    paddingTop: '7px',
+                                                    paddingBottom: '7px',
+                                                }}
+                                                autoFocus
+                                            />
                                             {(isStreaming || isWaiting) ? (
                                                 <button className="btn btn-stop-generation" onClick={() => {
                                                     if (!id || !activeSession?.id) return;
