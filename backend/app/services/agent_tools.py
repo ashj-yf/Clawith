@@ -42,8 +42,12 @@ _TOOL_CONFIG_CACHE_TTL_SECONDS = 60
 SENSITIVE_FIELD_KEYS = {"api_key", "private_key", "auth_code", "password", "secret", "atlassian_api_key"}
 
 
-def _decrypt_sensitive_fields(config: dict) -> dict:
-    """Decrypt sensitive fields in config dict."""
+def _decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
+    """Decrypt sensitive fields in config dict.
+
+    When config_schema is provided, also decrypts fields with type='password'
+    (e.g. smithery_api_key) that are not in the hardcoded SENSITIVE_FIELD_KEYS.
+    """
     if not config:
         return config
 
@@ -53,7 +57,16 @@ def _decrypt_sensitive_fields(config: dict) -> dict:
     settings = get_settings()
     result = dict(config)
 
-    for key in SENSITIVE_FIELD_KEYS:
+    # Build the set of sensitive keys: hardcoded + schema-derived
+    sensitive_keys = set(SENSITIVE_FIELD_KEYS)
+    if config_schema:
+        for field in config_schema.get("fields", []):
+            if field.get("type") == "password":
+                key = field.get("key", "")
+                if key:
+                    sensitive_keys.add(key)
+
+    for key in sensitive_keys:
         if key in result and result[key]:
             value = result[key]
             if isinstance(value, str) and value:
@@ -86,13 +99,16 @@ def _set_cached_tool_config(agent_id: Optional[uuid.UUID], tool_name: str, confi
 
 
 async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Optional[dict]:
-    """获取工具配置（带缓存）。
+    """Get merged tool config (with caching).
 
-    优先级：
-    1. agent_tools.config (per-agent 配置)
-    2. tools.config (全局配置)
+    Priority:
+    1. agent_tools.config (per-agent override)
+    2. tools.config (company/global config)
+
+    Both configs are decrypted using the tool's config_schema for
+    schema-aware field detection (e.g. smithery_api_key with type=password).
     """
-    # 先检查缓存
+    # Check cache first
     cached = _get_cached_tool_config(agent_id, tool_name)
     if cached is not None:
         logger.debug(f"[ToolConfig] Cache hit for {tool_name}, agent_id={agent_id}: {cached}")
@@ -101,32 +117,32 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     from app.models.tool import Tool, AgentTool
 
     async with async_session() as db:
-        # 1. 先查 per-agent 配置
+        # 1. Try per-agent + global config together
         if agent_id:
             result = await db.execute(
-                select(AgentTool.config, Tool.config)
+                select(AgentTool.config, Tool.config, Tool.config_schema)
                 .join(Tool, AgentTool.tool_id == Tool.id)
                 .where(AgentTool.agent_id == agent_id, Tool.name == tool_name)
             )
             row = result.first()
             if row:
-                agent_config, global_config = row
-                # 合并配置：agent_config 覆盖 global_config
+                agent_config, global_config, config_schema = row
+                # Merge: agent overrides global
                 merged = {**(global_config or {}), **(agent_config or {})}
                 if merged:
-                    # Decrypt before returning
-                    merged = _decrypt_sensitive_fields(merged)
-                    logger.info(f"[ToolConfig] DB merged config for {tool_name}, agent_id={agent_id}: {merged}")
+                    # Decrypt with schema awareness
+                    merged = _decrypt_sensitive_fields(merged, config_schema)
+                    logger.info(f"[ToolConfig] DB merged config for {tool_name}, agent_id={agent_id}")
                     _set_cached_tool_config(agent_id, tool_name, merged)
                     return merged
 
-        # 2. 回退到全局配置
+        # 2. Fallback to global config only
         result = await db.execute(select(Tool).where(Tool.name == tool_name))
         tool = result.scalar_one_or_none()
         if tool and tool.config:
-            # Decrypt before returning
-            decrypted = _decrypt_sensitive_fields(tool.config)
-            logger.info(f"[ToolConfig] DB global config for {tool_name}: {decrypted}")
+            # Decrypt with schema awareness
+            decrypted = _decrypt_sensitive_fields(tool.config, tool.config_schema)
+            logger.info(f"[ToolConfig] DB global config for {tool_name}")
             _set_cached_tool_config(agent_id, tool_name, decrypted)
             return decrypted
 
@@ -909,12 +925,14 @@ AGENT_TOOLS = [
             },
         },
     },
+    # ── Feishu Drive Share (collaborator management for all file types) ──
     {
         "type": "function",
         "function": {
-            "name": "feishu_doc_share",
+            "name": "feishu_drive_share",
             "description": (
-                "Manage Feishu document collaborators and permissions. "
+                "Manage Feishu Drive file collaborators and permissions. "
+                "Supports ALL file types: docx, bitable, sheet, doc, folder, mindnote, slides. "
                 "Can add or remove collaborators with viewer/editor/full_access roles, "
                 "or get the current collaborator list. "
                 "Accepts colleague names (auto-searched) or open_ids directly."
@@ -924,7 +942,12 @@ AGENT_TOOLS = [
                 "properties": {
                     "document_token": {
                         "type": "string",
-                        "description": "Feishu document token (from feishu_doc_create or doc URL)",
+                        "description": "File token (from feishu_doc_create, bitable_create_app, or URL)",
+                    },
+                    "doc_type": {
+                        "type": "string",
+                        "enum": ["docx", "bitable", "sheet", "doc", "folder", "mindnote", "slides"],
+                        "description": "File type. Default: 'docx'. Use 'bitable' for Bitable, 'sheet' for Spreadsheet, etc.",
                     },
                     "action": {
                         "type": "string",
@@ -948,6 +971,34 @@ AGENT_TOOLS = [
                     },
                 },
                 "required": ["document_token", "action"],
+            },
+        },
+    },
+    # ── Feishu Drive Delete (delete files from cloud space) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "feishu_drive_delete",
+            "description": (
+                "Delete a file or folder from Feishu Drive (cloud space). "
+                "The file will be moved to the recycle bin, not permanently deleted. "
+                "For folders, the deletion is asynchronous. "
+                "Requires ownership + parent folder edit permission, or parent folder full_access."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_token": {
+                        "type": "string",
+                        "description": "Token of the file or folder to delete (from URL or previous tool output)",
+                    },
+                    "file_type": {
+                        "type": "string",
+                        "enum": ["file", "docx", "bitable", "folder", "doc", "sheet", "mindnote", "shortcut", "slides"],
+                        "description": "Type of the file to delete. Use 'docx' for documents, 'bitable' for multitable, 'sheet' for spreadsheets, 'file' for uploaded files, 'folder' for folders.",
+                    },
+                },
+                "required": ["file_token", "file_type"],
             },
         },
     },
@@ -1335,7 +1386,8 @@ _FEISHU_TOOL_NAMES = {
     "feishu_doc_read",
     "feishu_doc_create",
     "feishu_doc_append",
-    "feishu_doc_share",
+    "feishu_drive_share",
+    "feishu_drive_delete",
     "feishu_calendar_list",
     "feishu_calendar_create",
     "feishu_calendar_update",
@@ -1584,7 +1636,7 @@ async def _execute_tool_direct(
             logger.info(f"[DirectTool] Executing code with arguments: {arguments}")
             return await _execute_code(agent_id, ws, arguments)
         elif tool_name == "web_search":
-            return await _web_search(arguments)
+            return await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
             return await _jina_search(arguments)
         elif tool_name == "send_feishu_message":
@@ -1605,8 +1657,14 @@ async def execute_tool(
     arguments: dict,
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
+    session_id: str = "",
 ) -> str:
-    """Execute a tool call and return the result as a string."""
+    """Execute a tool call and return the result as a string.
+
+    Args:
+        session_id: The ChatSession ID, used to isolate AgentBay instances
+                    per conversation. Passed through to agentbay_* tools.
+    """
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 
     ws = await ensure_workspace(agent_id, tenant_id=_agent_tenant_id)
@@ -1634,6 +1692,23 @@ async def execute_tool(
         except Exception as e:
             logger.exception(f"[Autonomy] Check failed: {e}")
             return f"⚠️ Autonomy check failed ({e}). Operation blocked for safety. Please retry or contact admin."
+
+    # Pre-inject session_id into arguments for AgentBay tools so each
+    # _agentbay_* handler can pass it to get_agentbay_client_for_agent()
+    # for per-ChatSession isolation of cloud instances.
+    if tool_name.startswith("agentbay_"):
+        arguments["_session_id"] = session_id
+
+        # Take Control lock: block automatic tool execution while a human
+        # is manually controlling the browser/desktop session. This prevents
+        # input collisions between human clicks and agent-initiated actions.
+        from app.api.agentbay_control import is_session_locked
+        if is_session_locked(str(agent_id), session_id):
+            return (
+                "⏸️ A human operator is currently controlling this browser session "
+                "(Take Control mode). Please wait for them to finish before retrying "
+                "browser/computer operations."
+            )
 
     try:
         if tool_name == "list_files":
@@ -1682,7 +1757,7 @@ async def execute_tool(
         elif tool_name == "send_channel_file":
             result = await _send_channel_file(agent_id, ws, arguments)
         elif tool_name == "web_search":
-            result = await _web_search(arguments)
+            result = await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
             result = await _jina_search(arguments)
         elif tool_name == "bing_search":
@@ -1731,8 +1806,10 @@ async def execute_tool(
         elif tool_name == "feishu_doc_append":
             result = await _feishu_doc_append(agent_id, arguments)
         # ── Feishu Calendar Tools ──
-        elif tool_name == "feishu_doc_share":
-            result = await _feishu_doc_share(agent_id, arguments)
+        elif tool_name in ("feishu_drive_share", "feishu_doc_share"):  # backward compat
+            result = await _feishu_drive_share(agent_id, arguments)
+        elif tool_name == "feishu_drive_delete":
+            result = await _feishu_drive_delete(agent_id, arguments)
         elif tool_name == "feishu_user_search":
             result = await _feishu_user_search(agent_id, arguments)
         elif tool_name == "feishu_calendar_list":
@@ -1825,8 +1902,11 @@ async def execute_tool(
         return f"Tool execution error ({tool_name}): {type(e).__name__}: {str(e)[:200]}"
 
 
-async def _web_search(arguments: dict) -> str:
-    """Search the web using a configurable search engine (reads config from DB)."""
+async def _web_search(arguments: dict, agent_id: uuid.UUID | None = None) -> str:
+    """Search the web using a configurable search engine.
+
+    Config resolution priority: Agent config > Company config > Defaults.
+    """
     import httpx
     import re
 
@@ -1834,17 +1914,8 @@ async def _web_search(arguments: dict) -> str:
     if not query:
         return "❌ Please provide search keywords"
 
-    # Load config from DB
-    config = {}
-    try:
-        from app.models.tool import Tool
-        async with async_session() as db:
-            r = await db.execute(select(Tool).where(Tool.name == "web_search"))
-            tool = r.scalar_one_or_none()
-            if tool and tool.config:
-                config = tool.config
-    except Exception:
-        pass
+    # Use the standard _get_tool_config helper (Agent > Company, cached, decrypted)
+    config = await _get_tool_config(agent_id, "web_search") or {}
 
     engine = config.get("search_engine", "duckduckgo")
     api_key = config.get("api_key", "")
@@ -4781,31 +4852,14 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     if not file_path and not url:
         return "❌ Please provide either 'file_path' (workspace path) or 'url' (public image URL)"
 
-    # ── Load ImageKit credentials (global → per-agent fallback) ──
+    # ── Load ImageKit credentials (Agent > Company priority) ──
     private_key = ""
     url_endpoint = ""
     try:
-        from app.models.tool import Tool, AgentTool
-        async with async_session() as db:
-            # Global config
-            r = await db.execute(select(Tool).where(Tool.name == "upload_image"))
-            tool = r.scalar_one_or_none()
-            if tool and tool.config:
-                private_key = tool.config.get("private_key", "")
-                url_endpoint = tool.config.get("url_endpoint", "")
-
-            # Per-agent override (if global key is empty)
-            if not private_key and tool:
-                r2 = await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == agent_id,
-                        AgentTool.tool_id == tool.id,
-                    )
-                )
-                agent_tool = r2.scalar_one_or_none()
-                if agent_tool and agent_tool.config:
-                    private_key = agent_tool.config.get("private_key", "") or private_key
-                    url_endpoint = agent_tool.config.get("url_endpoint", "") or url_endpoint
+        # Use standard _get_tool_config (Agent > Company, cached, schema-aware decryption)
+        config = await _get_tool_config(agent_id, "upload_image") or {}
+        private_key = config.get("private_key", "")
+        url_endpoint = config.get("url_endpoint", "")
     except Exception as e:
         logger.error(f"[UploadImage] Config load error: {e}")
 
@@ -5147,19 +5201,46 @@ async def _resolve_bitable_app_token(agent_id: uuid.UUID, parsed_url: dict) -> s
     return None
 
 def _check_feishu_err(resp: dict) -> str | None:
+    """Check Feishu API response for errors and return a user-friendly message.
+
+    For permission-related errors, returns detailed step-by-step instructions
+    guiding the user through the Feishu UI to grant the bot app access to
+    the target document or Bitable.
+    """
     code = resp.get("code")
     if code != 0:
         msg = str(resp.get("msg", ""))
-        if code in [99991663, 10006, 99991661, 99991668] or "permission" in msg.lower() or "403" in msg:
+        msg_lower = msg.lower()
+        # Common Feishu permission/access error codes:
+        #   99991663 - no permission to access resource
+        #   99991661 - token invalid / access denied
+        #   99991668 - permission denied on resource
+        #   10006    - no permission
+        #   91403    - Forbidden (bitable write without app access)
+        #   91404    - bitable record not found (sometimes permission)
+        #   1063001  - doc permission denied
+        #   1063004  - doc operation forbidden
+        _perm_codes = {99991663, 10006, 99991661, 99991668, 91403, 1063001, 1063004}
+        _perm_keywords = ("permission", "forbidden", "no access", "access denied", "403")
+        is_perm_error = code in _perm_codes or any(kw in msg_lower for kw in _perm_keywords)
+        if is_perm_error:
             return (
-                f"Failed: Permission denied (code: {code}). "
+                f"Failed: Permission denied (code: {code}, msg: {msg}). "
                 "The bot app does not have access to this document/Bitable. "
-                "CRITICAL INSTRUCTION for the Agent: You MUST explicitly output the following "
-                "step-by-step instructions to the user in your reply to help them grant permission:\n"
-                "1. 在飞书文档左上或者右上角点击「...」菜单。\n"
-                "2. 将鼠标悬浮至「更多」。\n"
-                "3. 点击「添加文档应用」。\n"
-                "4. 搜索当前机器人名字或者 Clawith 并点击添加。"
+                "CRITICAL INSTRUCTION for the Agent: You MUST explicitly output ALL of the following "
+                "step-by-step instructions to the user in your reply. Do NOT omit or summarize any step:\n\n"
+                "---\n"
+                "**The bot needs to be added to this document/table as an authorized app. "
+                "Please follow these steps:**\n\n"
+                "1. Open the target document or Bitable in the Feishu client (web or desktop).\n"
+                "2. Click the **「...」** menu button in the top-right corner of the page.\n"
+                "3. In the dropdown menu, hover over **「更多」** (More) at the bottom.\n"
+                "4. In the sub-menu that appears, click **「添加文档应用」** (Add Document App).\n"
+                "5. In the search box, type the name of your Feishu bot app (the one bound to this Agent's channel), then click to add it.\n"
+                "6. After adding, retry the same operation.\n\n"
+                "If you cannot find 「添加文档应用」, it means the document owner may need to enable this option, "
+                "or you can try: click **「分享」** (Share) button -> invite the bot app directly.\n"
+                "---"
             )
         return f"Failed: API Error {code} - {msg}"
     return None
@@ -5195,10 +5276,10 @@ async def _bitable_list_tables(agent_id: uuid.UUID, arguments: dict) -> str:
 
 
 async def _bitable_create_app(agent_id: uuid.UUID, arguments: dict) -> str:
-    """Create a new Feishu Bitable (多维表格) app in the user's Drive.
+    """Create a new Feishu Bitable (多维表格) app.
 
-    Calls the Drive v1 files API with type='bitable'.
-    Resolves the tenant domain to return a user-accessible URL.
+    Calls the Bitable v1 apps API: POST /open-apis/bitable/v1/apps
+    The API response includes a user-accessible URL with the tenant's own domain.
     """
     name = arguments.get("name", "").strip()
     if not name:
@@ -5217,23 +5298,28 @@ async def _bitable_create_app(agent_id: uuid.UUID, arguments: dict) -> str:
         if err:
             return err
 
-        # The Drive API returns the new file info under data.file (or data.token in some versions)
-        file_info = resp.get("data", {}).get("file", {}) or resp.get("data", {})
-        app_token = file_info.get("token", "") or file_info.get("app_token", "")
+        # API response structure: data.app.{app_token, name, url, default_table_id, folder_token}
+        app_info = resp.get("data", {}).get("app", {})
+        app_token = app_info.get("app_token", "")
+        bitable_url = app_info.get("url", "")
+        default_table_id = app_info.get("default_table_id", "")
         if not app_token:
             return f"Failed: Bitable created but could not extract app_token from response: {resp}"
 
-        # Build a user-accessible URL with the tenant's real domain
-        tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
-        bitable_url = await _get_feishu_bitable_url(tenant_token, app_token)
+        # Fallback URL resolution if the API didn't return one
+        if not bitable_url:
+            tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
+            bitable_url = await _get_feishu_bitable_url(tenant_token, app_token)
 
-        return (
-            f"✅ 多维表格创建成功！\n"
-            f"名称：{name}\n"
-            f"App Token：{app_token}\n"
-            f"🔗 访问链接：{bitable_url}\n"
-            f"下一步：可以调用 bitable_list_tables(url='{bitable_url}') 查看初始数据表。"
+        result = (
+            f"OK: Bitable created successfully!\n"
+            f"Name: {name}\n"
+            f"App Token: {app_token}\n"
+            f"URL: {bitable_url}"
         )
+        if default_table_id:
+            result += f"\nDefault Table ID: {default_table_id}"
+        return result
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
@@ -5937,11 +6023,12 @@ async def _feishu_doc_append(agent_id: uuid.UUID, arguments: dict) -> str:
         return f"Failed: {str(e)[:300]}"
 
 
-# ─── Feishu Document Share ────────────────────────────────────────────────────
+# ─── Feishu Drive Share (all file types) ──────────────────────────────────────
 
-async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
-    """Manage Feishu document collaborators.
-    Automatically handles both regular docx documents (Drive permissions API)
+async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
+    """Manage Feishu Drive file collaborators.
+    Supports all file types: docx, bitable, sheet, doc, folder, mindnote, slides.
+    Automatically handles both regular files (Drive permissions API)
     and Wiki node documents (Wiki space members API).
     """
     import httpx
@@ -5950,6 +6037,8 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
     document_token = (arguments.get("document_token") or "").strip()
     action = (arguments.get("action") or "list").strip()
     permission = (arguments.get("permission") or "edit").strip()
+    # doc_type defaults to 'docx' for backward compatibility
+    doc_type = (arguments.get("doc_type") or "docx").strip()
 
     if not document_token:
         return "❌ Missing required argument 'document_token'"
@@ -5978,7 +6067,7 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"https://open.feishu.cn/open-apis/drive/v1/permissions/{use_token}/members",
-                params={"type": "docx"},
+                params={"type": doc_type},
                 headers=headers,
             )
         data = resp.json()
@@ -6073,7 +6162,7 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
                     f"https://open.feishu.cn/open-apis/drive/v1/permissions/{document_token}/members",
                     json=body,
                     headers=headers,
-                    params={"type": "docx"},
+                    params={"type": doc_type},
                 )
                 d = resp.json()
                 if d.get("code") == 0:
@@ -6113,7 +6202,7 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
                 resp = await client.delete(
                     f"https://open.feishu.cn/open-apis/drive/v1/permissions/{document_token}/members/{oid}",
                     headers=headers,
-                    params={"type": "docx", "member_type": "openid"},
+                    params={"type": doc_type, "member_type": "openid"},
                 )
                 d = resp.json()
                 if d.get("code") == 0:
@@ -6122,6 +6211,85 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
                     results.append(f"❌ 移除「{display}」失败：{d.get('msg')} (code {d.get('code')})")
 
     return "\n".join(results) if results else "没有需要处理的成员"
+
+
+# ─── Feishu Drive Delete ──────────────────────────────────────────────────────
+
+async def _feishu_drive_delete(agent_id: uuid.UUID, arguments: dict) -> str:
+    """Delete a file or folder from Feishu Drive (cloud space).
+    The file is moved to the recycle bin, not permanently deleted.
+    For folders, the deletion is asynchronous and returns a task_id.
+    """
+    import httpx
+
+    file_token = (arguments.get("file_token") or "").strip()
+    file_type = (arguments.get("file_type") or "").strip()
+
+    if not file_token:
+        return "❌ Missing required argument 'file_token'"
+    if not file_type:
+        return "❌ Missing required argument 'file_type'. Valid values: file, docx, bitable, folder, doc, sheet, mindnote, shortcut, slides"
+
+    valid_types = {"file", "docx", "bitable", "folder", "doc", "sheet", "mindnote", "shortcut", "slides"}
+    if file_type not in valid_types:
+        return f"❌ Invalid file_type '{file_type}'. Valid values: {', '.join(sorted(valid_types))}"
+
+    app_id, app_secret = await _get_feishu_credentials(agent_id)
+    if not app_id or not app_secret:
+        return "❌ Agent has no Feishu channel configured."
+    from app.services.feishu_service import feishu_service
+    token = await feishu_service.get_tenant_access_token(app_id, app_secret)
+
+    # Type label mapping for user-friendly output
+    type_labels = {
+        "file": "文件", "docx": "文档", "bitable": "多维表格",
+        "folder": "文件夹", "doc": "旧版文档", "sheet": "电子表格",
+        "mindnote": "思维笔记", "shortcut": "快捷方式", "slides": "幻灯片",
+    }
+    type_label = type_labels.get(file_type, file_type)
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.delete(
+                f"https://open.feishu.cn/open-apis/drive/v1/files/{file_token}",
+                params={"type": file_type},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        data = resp.json()
+        code = data.get("code", -1)
+
+        if code == 0:
+            # Folder deletion returns a task_id for async tracking
+            task_id = data.get("data", {}).get("task_id")
+            if task_id:
+                return (
+                    f"✅ 已提交{type_label}删除任务（异步执行中）。\n"
+                    f"📋 任务 ID: `{task_id}`\n"
+                    f"文件夹删除为异步操作，文件会被移至回收站。"
+                )
+            return f"✅ {type_label} `{file_token}` 已删除（移至回收站）。"
+
+        # Error handling with specific codes
+        msg = data.get("msg", "Unknown error")
+        if code == 1061003:
+            return f"❌ 未找到文件 `{file_token}`。请确认文件 token 和类型是否正确。"
+        elif code == 1061004:
+            return (
+                f"❌ 权限不足（code {code}）\n"
+                "需要满足以下条件之一：\n"
+                "• 文件所有者 + 父文件夹编辑权限\n"
+                "• 父文件夹的所有者或 full_access 权限\n"
+                "同时需要在飞书开放平台开通：drive:drive 或 space:document:delete"
+            )
+        elif code == 1061007:
+            return f"❌ 文件 `{file_token}` 已被删除。"
+        elif code == 1061045:
+            return f"⚠️ 接口频率限制，请稍后重试。（每秒最多 5 次）"
+        else:
+            return f"❌ 删除{type_label}失败：{msg} (code {code})"
+
+    except Exception as e:
+        return f"❌ 删除文件异常: {str(e)[:300]}"
 
 
 # ─── Feishu Calendar Tools ────────────────────────────────────────────────────
@@ -6848,7 +7016,8 @@ async def _agentbay_browser_navigate(agent_id: Optional[uuid.UUID], ws: Path, ar
     save_to_workspace = arguments.get("save_to_workspace", False)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         # Always request a screenshot for navigation so the model can observe the result
         result = await client.browser_navigate(url, wait_for=wait_for, screenshot=True)
 
@@ -6927,7 +7096,8 @@ async def _agentbay_browser_screenshot(agent_id: Optional[uuid.UUID], ws: Path, 
     save_to_workspace = arguments.get("save_to_workspace", False)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         result = await client.browser_screenshot()
 
         screenshot_data = result.get("screenshot")
@@ -6986,7 +7156,8 @@ async def _agentbay_browser_click(agent_id: Optional[uuid.UUID], ws: Path, argum
     selector = arguments.get("selector", "")
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         await client.browser_click(selector)
         return f"✅ 已点击元素: {selector}"
     except RuntimeError as e:
@@ -7007,7 +7178,8 @@ async def _agentbay_browser_type(agent_id: Optional[uuid.UUID], ws: Path, argume
     text = arguments.get("text", "")
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         await client.browser_type(selector, text)
         return f"✅ 已在 {selector} 输入文本"
     except RuntimeError as e:
@@ -7032,7 +7204,8 @@ async def _agentbay_code_execute(agent_id: Optional[uuid.UUID], ws: Path, argume
         return "❌ 请提供要执行的代码"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "code")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "code", session_id=_session_id)
         result = await client.code_execute(language, code, timeout)
 
         # 格式化返回结果
@@ -7246,7 +7419,8 @@ async def _agentbay_browser_extract(agent_id: Optional[uuid.UUID], ws: Path, arg
         return "Missing required argument 'instruction'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         result = await client.browser_extract(instruction, selector=selector)
 
         if result.get("success"):
@@ -7278,7 +7452,8 @@ async def _agentbay_browser_observe(agent_id: Optional[uuid.UUID], ws: Path, arg
         return "Missing required argument 'instruction'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         result = await client.browser_observe(instruction, selector=selector)
 
         if result.get("success"):
@@ -7320,7 +7495,8 @@ async def _agentbay_browser_login(agent_id: Optional[uuid.UUID], ws: Path, argum
         return "Missing required argument 'login_config' (JSON string with api_key + skill_id)"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         result = await client.browser_login(url, login_config)
 
         if result.get("success"):
@@ -7350,7 +7526,8 @@ async def _agentbay_command_exec(agent_id: Optional[uuid.UUID], ws: Path, argume
         return "Missing required argument 'command'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "code")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "code", session_id=_session_id)
         result = await client.command_exec(command, timeout_ms=timeout_ms, cwd=cwd)
 
         parts = []
@@ -7423,7 +7600,8 @@ async def _agentbay_computer_screenshot(agent_id: Optional[uuid.UUID], ws: Path,
     save_to_workspace = arguments.get("save_to_workspace", False)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_screenshot()
 
         if not (result.get("success") and result.get("data")):
@@ -7485,7 +7663,8 @@ async def _agentbay_computer_click(agent_id: Optional[uuid.UUID], ws: Path, argu
     button = arguments.get("button", "left")
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_click(x, y, button=button)
         if result.get("success"):
             return f"Clicked at ({x}, {y}) with {button} button"
@@ -7509,7 +7688,8 @@ async def _agentbay_computer_input_text(agent_id: Optional[uuid.UUID], ws: Path,
         return "Missing required argument 'text'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_input_text(text)
         if result.get("success"):
             return f"Typed text: {text[:100]}"
@@ -7535,7 +7715,8 @@ async def _agentbay_computer_press_keys(agent_id: Optional[uuid.UUID], ws: Path,
         return "Missing required argument 'keys'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_press_keys(keys, hold=hold)
         key_str = "+".join(keys)
         if result.get("success"):
@@ -7561,7 +7742,8 @@ async def _agentbay_computer_scroll(agent_id: Optional[uuid.UUID], ws: Path, arg
     amount = arguments.get("amount", 1)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_scroll(x, y, direction=direction, amount=amount)
         if result.get("success"):
             return f"Scrolled {direction} by {amount} step(s) at ({x}, {y})"
@@ -7584,7 +7766,8 @@ async def _agentbay_computer_move_mouse(agent_id: Optional[uuid.UUID], ws: Path,
     y = arguments.get("y", 0)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_move_mouse(x, y)
         if result.get("success"):
             return f"Mouse moved to ({x}, {y})"
@@ -7610,7 +7793,8 @@ async def _agentbay_computer_drag_mouse(agent_id: Optional[uuid.UUID], ws: Path,
     button = arguments.get("button", "left")
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_drag_mouse(from_x, from_y, to_x, to_y, button=button)
         if result.get("success"):
             return f"Dragged from ({from_x}, {from_y}) to ({to_x}, {to_y})"
@@ -7630,7 +7814,8 @@ async def _agentbay_computer_get_screen_size(agent_id: Optional[uuid.UUID], ws: 
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_get_screen_size()
         if result.get("success"):
             import json
@@ -7659,7 +7844,8 @@ async def _agentbay_computer_start_app(agent_id: Optional[uuid.UUID], ws: Path, 
         return "Missing required argument 'cmd'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_start_app(cmd, work_dir=work_dir)
         if result.get("success"):
             # result.data may contain non-serializable objects (e.g. Process),
@@ -7690,7 +7876,8 @@ async def _agentbay_computer_get_cursor_position(agent_id: Optional[uuid.UUID], 
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_get_cursor_position()
         if result.get("success"):
             import json
@@ -7713,7 +7900,8 @@ async def _agentbay_computer_get_active_window(agent_id: Optional[uuid.UUID], ws
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_get_active_window()
         if result.get("success"):
             import json
@@ -7740,7 +7928,8 @@ async def _agentbay_computer_activate_window(agent_id: Optional[uuid.UUID], ws: 
         return "Missing required argument 'window_id'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_activate_window(int(window_id))
         if result.get("success"):
             return f"Window {window_id} activated (brought to front)"
@@ -7760,7 +7949,8 @@ async def _agentbay_computer_list_visible_apps(agent_id: Optional[uuid.UUID], ws
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_list_visible_apps()
         if result.get("success"):
             import json
