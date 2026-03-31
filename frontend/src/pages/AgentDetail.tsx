@@ -14,6 +14,7 @@ import AgentBayLivePanel, { LivePreviewState } from '../components/AgentBayLiveP
 import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress } from '../services/api';
 import { useAppStore } from '../stores';
 import { useAuthStore } from '../stores';
+import { copyToClipboard } from '../utils/clipboard';
 
 const TABS = ['status', 'aware', 'mind', 'tools', 'skills', 'relationships', 'workspace', 'chat', 'activityLog', 'approvals', 'settings'] as const;
 
@@ -565,10 +566,30 @@ function CopyMessageButton({ text }: { text: string }) {
     const [copied, setCopied] = React.useState(false);
     const handleCopy = (e: React.MouseEvent) => {
         e.stopPropagation();
-        navigator.clipboard.writeText(text).then(() => {
+        const copySuccess = () => {
             setCopied(true);
             setTimeout(() => setCopied(false), 1500);
-        });
+        };
+        
+        if (navigator.clipboard && window.isSecureContext) {
+            copyToClipboard(text).then(copySuccess).catch(err => console.error('Clipboard API failed', err));
+        } else {
+            // Fallback for non-HTTPS dev environments
+            const textArea = document.createElement("textarea");
+            textArea.value = text;
+            textArea.style.position = "fixed";  // Avoid scrolling to bottom
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            try {
+                if (document.execCommand('copy')) {
+                    copySuccess();
+                }
+            } catch (err) {
+                console.error('Fallback copy failed', err);
+            }
+            document.body.removeChild(textArea);
+        }
     };
     return (
         <button
@@ -1901,7 +1922,7 @@ function AgentDetailInner() {
 
     const CopyBtn = ({ url }: { url: string }) => (
         <button title="Copy" style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', marginLeft: '6px', padding: '1px 4px', cursor: 'pointer', borderRadius: '3px', border: '1px solid var(--border-color)', background: 'var(--bg-primary)', color: 'var(--text-secondary)', verticalAlign: 'middle', lineHeight: 1 }}
-            onClick={() => navigator.clipboard.writeText(url).then(() => { })}>
+            onClick={() => copyToClipboard(url).then(() => { })}>
             <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <rect x="4" y="4" width="9" height="11" rx="1.5" /><path d="M3 11H2a1 1 0 01-1-1V2a1 1 0 011-1h8a1 1 0 011 1v1" />
             </svg>
