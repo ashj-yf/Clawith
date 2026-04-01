@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '../stores';
 import { authApi, tenantApi, fetchJson } from '../services/api';
@@ -8,8 +8,10 @@ import type { TokenResponse } from '../types';
 export default function Login() {
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
+    const invitationCode = searchParams.get('code');
     const setAuth = useAuthStore((s) => s.setAuth);
-    const [isRegister, setIsRegister] = useState(false);
+    const [isRegister, setIsRegister] = useState(!!invitationCode);
     const [error, setError] = useState('');
     const [successMessage, setSuccessMessage] = useState('');
     const [loading, setLoading] = useState(false);
@@ -95,6 +97,7 @@ export default function Login() {
                     email: form.login_identifier,
                     password: form.password,
                     display_name: form.login_identifier.split('@')[0],
+                    ...(invitationCode ? { invitation_code: invitationCode } : {})
                 });
                 // Save authentication state for company selection (user not active yet)
                 if (regRes.access_token && regRes.user) {
@@ -154,6 +157,8 @@ export default function Login() {
                     setError(t('auth.notInOrganization', 'This account does not belong to this organization.'));
                 } else if (msg.includes('500') || msg.includes('Internal Server Error')) {
                     setError(t('auth.serverStarting'));
+                } else if (msg.includes('Email already registered') || msg.includes('该邮箱已注册')) {
+                    setError(t('auth.emailAlreadyRegistered', '该邮箱已注册，请直接登录'));
                 } else {
                     setError(msg);
                 }
@@ -441,10 +446,10 @@ export default function Login() {
                                     {t('auth.multiTenantPrompt', '该邮箱对应多个公司，请选择要登录的公司：')}
                                 </p>
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                    {tenantSelection.map((t: any) => (
+                                    {tenantSelection.map((tenant: any) => (
                                         <button
-                                            key={t.tenant_id}
-                                            onClick={() => handleTenantSelect(t.tenant_id)}
+                                            key={tenant.tenant_id}
+                                            onClick={() => handleTenantSelect(tenant.tenant_id)}
                                             style={{
                                                 padding: '12px 16px',
                                                 borderRadius: '8px',
@@ -456,9 +461,45 @@ export default function Login() {
                                                 textAlign: 'left',
                                             }}
                                         >
-                                            {t.tenant_name} {t.tenant_slug && `(${t.tenant_slug})`}
+                                            {tenant.tenant_name} {tenant.tenant_slug && `(${tenant.tenant_slug})`}
                                         </button>
                                     ))}
+                                    {/* Create or Join Organization */}
+                                    <button
+                                        onClick={async () => {
+                                            // Log in with the first tenant to get a valid token, then redirect to company setup
+                                            try {
+                                                setLoading(true);
+                                                const firstTenant = tenantSelection[0];
+                                                const res = await authApi.login({
+                                                    login_identifier: form.login_identifier,
+                                                    password: form.password,
+                                                    tenant_id: firstTenant.tenant_id,
+                                                });
+                                                const tokenRes = res as TokenResponse;
+                                                setAuth(tokenRes.user, tokenRes.access_token);
+                                                setTenantSelection(null);
+                                                navigate('/setup-company?from=tenant-selection');
+                                            } catch (err: any) {
+                                                setError(err.message || 'Failed');
+                                                setTenantSelection(null);
+                                            } finally {
+                                                setLoading(false);
+                                            }
+                                        }}
+                                        style={{
+                                            padding: '12px 16px',
+                                            borderRadius: '8px',
+                                            border: '1px dashed var(--border-subtle)',
+                                            background: 'transparent',
+                                            color: 'var(--text-secondary)',
+                                            fontSize: '14px',
+                                            cursor: 'pointer',
+                                            textAlign: 'left',
+                                        }}
+                                    >
+                                        {t('auth.createOrJoinOrganization', 'Create or Join Organization')}
+                                    </button>
                                 </div>
                                 <button
                                     onClick={() => setTenantSelection(null)}
@@ -474,7 +515,7 @@ export default function Login() {
                                         width: '100%',
                                     }}
                                 >
-                                    {t('common.cancel', '取消')}
+                                    {t('common.cancel', 'Cancel')}
                                 </button>
                             </div>
                         </div>
