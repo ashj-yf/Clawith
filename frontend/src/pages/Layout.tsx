@@ -1,9 +1,11 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuthStore } from '../stores';
 import { agentApi } from '../services/api';
+
 import {
     IconHome,
     IconPlus,
@@ -23,7 +25,10 @@ import {
     IconPinnedOff,
     IconArrowUpRight,
     IconBuilding,
-    IconChevronUp
+    IconChevronUp,
+    IconSwitchHorizontal,
+    IconChevronRight,
+    IconCheck,
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 
@@ -41,6 +46,18 @@ const SidebarIcons = {
     expand: <IconChevronsRight size={16} stroke={1.5} />,
     bell: <IconBell size={16} stroke={1.5} />,
 };
+
+/** UI locales: native endonym per row. */
+const APP_UI_LANGUAGES: { code: string; nativeLabel: string }[] = [
+    { code: 'zh', nativeLabel: '中文' },
+    { code: 'en', nativeLabel: 'English' },
+];
+
+function resolveUiLangCode(lang: string | undefined): string {
+    if (!lang) return 'en';
+    if (lang.startsWith('zh')) return 'zh';
+    return 'en';
+}
 
 const fetchJson = async <T,>(url: string): Promise<T> => {
     const token = localStorage.getItem('token');
@@ -72,6 +89,7 @@ function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose
     const [newPassword, setNewPassword] = useState('');
     const [confirmPassword, setConfirmPassword] = useState('');
     const [saving, setSaving] = useState(false);
+    const [resendingEmail, setResendingEmail] = useState(false);
     const [msg, setMsg] = useState('');
     const [msgType, setMsgType] = useState<'success' | 'error'>('success');
 
@@ -99,6 +117,21 @@ function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose
             showMsg(isChinese ? '个人信息已更新' : 'Profile updated');
         } catch (e: any) { showMsg(e.message || 'Failed', 'error'); }
         setSaving(false);
+    };
+
+    const handleResendVerification = async () => {
+        setResendingEmail(true);
+        try {
+            const token = localStorage.getItem('token');
+            const res = await fetch('/api/auth/resend-verification', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ email: user?.email }),
+            });
+            if (!res.ok) { const err = await res.json().catch(() => ({ detail: 'Failed' })); throw new Error(err.detail); }
+            showMsg(isChinese ? '验证邮件已发送，请查收' : 'Verification email sent. Please check your inbox.');
+        } catch (e: any) { showMsg(e.message || 'Failed', 'error'); }
+        setResendingEmail(false);
     };
 
     const handleChangePassword = async () => {
@@ -135,7 +168,37 @@ function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose
                 <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: 'var(--text-secondary)' }}>{isChinese ? '个人信息' : 'Profile'}</h4>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '20px' }}>
                     <div><label style={labelStyle}>{isChinese ? '用户名' : 'Username'}</label><input className="form-input" value={username} onChange={e => setUsername(e.target.value)} style={inputStyle} /></div>
-                    <div><label style={labelStyle}>{isChinese ? '邮箱' : 'Email'}</label><input className="form-input" type="email" value={email} onChange={e => setEmail(e.target.value)} style={inputStyle} /></div>
+                    <div>
+                        <label style={labelStyle}>{isChinese ? '邮箱' : 'Email'}</label>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <input className="form-input" type="email" value={email} onChange={e => setEmail(e.target.value)} style={inputStyle} disabled />
+                            {user?.email_verified ? (
+                                <span style={{ color: '#16a34a', fontSize: '12px', whiteSpace: 'nowrap' }}>✓ {isChinese ? '已验证' : 'Verified'}</span>
+                            ) : (
+                                <button
+                                    onClick={handleResendVerification}
+                                    disabled={resendingEmail}
+                                    style={{
+                                        fontSize: '11px',
+                                        padding: '4px 8px',
+                                        borderRadius: '4px',
+                                        border: '1px solid var(--border-subtle)',
+                                        background: 'var(--bg-secondary)',
+                                        color: 'var(--text-secondary)',
+                                        cursor: resendingEmail ? 'not-allowed' : 'pointer',
+                                        whiteSpace: 'nowrap',
+                                    }}
+                                >
+                                    {resendingEmail ? '...' : (isChinese ? '发送验证' : 'Verify')}
+                                </button>
+                            )}
+                        </div>
+                        {!user?.email_verified && (
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                                {isChinese ? '邮箱未验证，请点击按钮发送验证邮件' : 'Email not verified. Click button to send verification email.'}
+                            </div>
+                        )}
+                    </div>
                     <div><label style={labelStyle}>{isChinese ? '显示名称' : 'Display Name'}</label><input className="form-input" value={displayName} onChange={e => setDisplayName(e.target.value)} style={inputStyle} /></div>
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}><button className="btn btn-primary" onClick={handleSaveProfile} disabled={saving} style={{ padding: '6px 16px', fontSize: '12px' }}>{saving ? '...' : (isChinese ? '保存' : 'Save')}</button></div>
                 </div>
@@ -176,10 +239,16 @@ export default function Layout() {
     const isChinese = i18n.language?.startsWith('zh');
     const [showAccountSettings, setShowAccountSettings] = useState(false);
     const [showAccountMenu, setShowAccountMenu] = useState(false);
+    const [showLanguageSubmenu, setShowLanguageSubmenu] = useState(false);
+    const [langSubmenuPos, setLangSubmenuPos] = useState({ top: 0, left: 0 });
     const accountMenuRef = useRef<HTMLDivElement>(null);
+    const accountDropdownRef = useRef<HTMLDivElement>(null);
+    const langSubmenuPortalRef = useRef<HTMLDivElement>(null);
+    const langHoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [showNotifications, setShowNotifications] = useState(false);
     const [notifCategory, setNotifCategory] = useState<string>('all');
     const [selectedNotification, setSelectedNotification] = useState<any | null>(null);
+    const [showTenantMenu, setShowTenantMenu] = useState(false);
 
     // Notification polling
     const { data: unreadCount = 0 } = useQuery({
@@ -207,6 +276,40 @@ export default function Layout() {
         await fetch(`/api/notifications/${id}/read`, { method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {} });
         queryClient.invalidateQueries({ queryKey: ['notifications-unread'] });
         queryClient.invalidateQueries({ queryKey: ['notifications'] });
+    };
+
+    // Tenant switching
+    const { data: myTenants = [] } = useQuery({
+        queryKey: ['my-tenants'],
+        queryFn: async () => {
+            const token = localStorage.getItem('token');
+            const res = await fetch('/api/auth/my-tenants', { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+            if (!res.ok) return [];
+            return res.json();
+        },
+        enabled: !!user,
+    });
+
+    const handleSwitchTenant = async (tenantId: string) => {
+        const token = localStorage.getItem('token');
+        const res = await fetch('/api/auth/switch-tenant', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ tenant_id: tenantId }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({ detail: 'Failed to switch tenant' }));
+            alert(err.detail || 'Failed to switch tenant');
+            return;
+        }
+        const data = await res.json();
+        if (data.redirect_url) {
+            localStorage.setItem('token', data.access_token);
+            window.location.href = data.redirect_url;
+        } else if (data.access_token) {
+            localStorage.setItem('token', data.access_token);
+            window.location.reload();
+        }
     };
 
     // Theme
@@ -264,19 +367,97 @@ export default function Layout() {
         navigate('/login');
     };
 
-    const toggleLang = () => {
-        i18n.changeLanguage(i18n.language === 'zh' ? 'en' : 'zh');
+    const selectUiLanguage = (code: string) => {
+        i18n.changeLanguage(code);
+        setShowLanguageSubmenu(false);
+        setShowAccountMenu(false);
     };
+
+    const openLangSubmenu = useCallback(() => {
+        if (langHoverCloseTimerRef.current) {
+            clearTimeout(langHoverCloseTimerRef.current);
+            langHoverCloseTimerRef.current = null;
+        }
+        setShowLanguageSubmenu(true);
+    }, []);
+
+    const scheduleCloseLangSubmenu = useCallback(() => {
+        if (langHoverCloseTimerRef.current) clearTimeout(langHoverCloseTimerRef.current);
+        langHoverCloseTimerRef.current = setTimeout(() => {
+            setShowLanguageSubmenu(false);
+            langHoverCloseTimerRef.current = null;
+        }, 200);
+    }, []);
+
+    useEffect(() => {
+        if (!showAccountMenu) {
+            if (langHoverCloseTimerRef.current) {
+                clearTimeout(langHoverCloseTimerRef.current);
+                langHoverCloseTimerRef.current = null;
+            }
+            setShowLanguageSubmenu(false);
+        }
+    }, [showAccountMenu]);
+
+    useEffect(() => () => {
+        if (langHoverCloseTimerRef.current) clearTimeout(langHoverCloseTimerRef.current);
+    }, []);
+
+    const updateLangSubmenuPosition = useCallback(() => {
+        const el = accountDropdownRef.current;
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        setLangSubmenuPos({ top: r.top, left: r.right + 2 });
+    }, []);
+
+    useLayoutEffect(() => {
+        if (!showLanguageSubmenu) return;
+        updateLangSubmenuPosition();
+        window.addEventListener('resize', updateLangSubmenuPosition);
+        window.addEventListener('scroll', updateLangSubmenuPosition, true);
+        return () => {
+            window.removeEventListener('resize', updateLangSubmenuPosition);
+            window.removeEventListener('scroll', updateLangSubmenuPosition, true);
+        };
+    }, [showLanguageSubmenu, updateLangSubmenuPosition]);
 
     useEffect(() => {
         const handleClickOutside = (e: MouseEvent) => {
-            if (accountMenuRef.current && !accountMenuRef.current.contains(e.target as Node)) {
-                setShowAccountMenu(false);
-            }
+            const t = e.target as Node;
+            if (accountMenuRef.current?.contains(t)) return;
+            if (langSubmenuPortalRef.current?.contains(t)) return;
+            setShowAccountMenu(false);
         };
-        if (showAccountMenu) document.addEventListener('mousedown', handleClickOutside);
+        if (showAccountMenu || showTenantMenu) document.addEventListener('mousedown', handleClickOutside);
         return () => document.removeEventListener('mousedown', handleClickOutside);
-    }, [showAccountMenu]);
+    }, [showAccountMenu, showTenantMenu]);
+
+    const langSubmenuContent = showAccountMenu && showLanguageSubmenu && (
+        <div
+            ref={langSubmenuPortalRef}
+            className="account-lang-submenu account-lang-submenu-portal"
+            role="menu"
+            style={{ top: langSubmenuPos.top, left: langSubmenuPos.left }}
+            onMouseEnter={openLangSubmenu}
+            onMouseLeave={scheduleCloseLangSubmenu}
+        >
+            {APP_UI_LANGUAGES.map(({ code, nativeLabel }) => {
+                const active = resolveUiLangCode(i18n.language) === code;
+                return (
+                    <button
+                        key={code}
+                        type="button"
+                        role="menuitem"
+                        className={`account-lang-submenu-item${active ? ' is-active' : ''}`}
+                        onClick={() => selectUiLanguage(code)}
+                    >
+                        <span>{nativeLabel}</span>
+                        {active && <IconCheck size={14} stroke={2} />}
+                    </button>
+                );
+            })}
+        </div>
+    );
 
     return (
         <div className={`app-layout ${isSidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
@@ -457,14 +638,70 @@ export default function Layout() {
                                     }}>{(unreadCount as number) > 99 ? '99+' : unreadCount}</span>
                                 )}
                             </button>
+                            {myTenants.length > 1 && (
+                                <div style={{ position: 'relative', marginLeft: 'auto' }}>
+                                    <button className="btn btn-ghost" onClick={() => setShowTenantMenu(v => !v)} style={{
+                                        padding: '4px 8px', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                    }} title={isChinese ? '切换企业' : 'Switch Organization'}>
+                                        <IconSwitchHorizontal size={16} stroke={1.5} />
+                                    </button>
+                                    {showTenantMenu && (
+                                        <div style={{
+                                            position: 'absolute', bottom: '100%', left: '50%', transform: 'translateX(-50%)',
+                                            minWidth: '160px', marginBottom: '4px', background: 'var(--bg-secondary)',
+                                            border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)',
+                                            boxShadow: '0 4px 12px rgba(0,0,0,0.15)', overflow: 'hidden', zIndex: 100,
+                                        }}>
+                                            {myTenants.map((tenant: any) => (
+                                                <button
+                                                    key={tenant.tenant_id}
+                                                    onClick={() => {
+                                                        handleSwitchTenant(tenant.tenant_id);
+                                                        setShowTenantMenu(false);
+                                                    }}
+                                                    style={{
+                                                        width: '100%', display: 'flex', alignItems: 'center', gap: '8px',
+                                                        padding: '10px 12px', background: tenant.tenant_id === currentTenant ? 'var(--bg-tertiary)' : 'transparent',
+                                                        border: 'none', color: 'var(--text-primary)', cursor: 'pointer', fontSize: '13px',
+                                                        textAlign: 'left', borderBottom: '1px solid var(--border-subtle)',
+                                                    }}
+                                                >
+                                                    <IconBuilding size={14} stroke={1.5} />
+                                                    <span style={{ flex: 1 }}>{tenant.tenant_name}</span>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                         </div>
                         <div ref={accountMenuRef} style={{ position: 'relative' }}>
                             {showAccountMenu && (
-                                <div className="account-dropdown">
-                                    <button className="account-dropdown-item" onClick={() => { toggleLang(); setShowAccountMenu(false); }}>
-                                        <IconWorld size={15} stroke={1.5} />
-                                        <span>{i18n.language === 'zh' ? 'English' : '中文'}</span>
-                                    </button>
+                                <div className="account-menus-container">
+                                <div className="account-dropdown" ref={accountDropdownRef}>
+                                    <div
+                                        className="account-dropdown-language-hover-wrap"
+                                        onMouseEnter={openLangSubmenu}
+                                        onMouseLeave={scheduleCloseLangSubmenu}
+                                    >
+                                        <button
+                                            type="button"
+                                            className="account-dropdown-item language-menu-trigger"
+                                            aria-haspopup="menu"
+                                            aria-expanded={showLanguageSubmenu}
+                                        >
+                                            <IconWorld size={15} stroke={1.5} />
+                                            <span className="language-menu-label">
+                                                {t('layout.language', {
+                                                    lng: resolveUiLangCode(i18n.language),
+                                                    defaultValue: 'Language',
+                                                })}
+                                            </span>
+                                            <span className="language-menu-chevron" aria-hidden>
+                                                <IconChevronRight size={16} stroke={1.75} />
+                                            </span>
+                                        </button>
+                                    </div>
                                     <button className="account-dropdown-item" onClick={() => { setShowAccountSettings(true); setShowAccountMenu(false); }}>
                                         <IconUser size={15} stroke={1.5} />
                                         <span>{isChinese ? '账户设置' : 'Account Settings'}</span>
@@ -475,7 +712,9 @@ export default function Layout() {
                                         <span>{t('layout.logout', 'Logout')}</span>
                                     </button>
                                 </div>
+                                </div>
                             )}
+                            {typeof document !== 'undefined' && langSubmenuContent && createPortal(langSubmenuContent, document.body)}
                             <div
                                 className="sidebar-account-row"
                                 onClick={() => setShowAccountMenu(v => !v)}
