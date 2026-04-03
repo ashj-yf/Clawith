@@ -1133,6 +1133,7 @@ function AgentDetailInner() {
     const currentAgentIdRef = useRef<string | undefined>(id);
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
     const sessionLoadSeqRef = useRef(0);
+    const chatInputAreaRef = useRef<HTMLDivElement>(null);
 
     const buildSessionRuntimeKey = (agentId: string, sessionId: string) => `${agentId}:${sessionId}`;
 
@@ -1165,6 +1166,8 @@ function AgentDetailInner() {
         if (sess.user_id && currentUser && sess.user_id !== String(currentUser.id)) return false;
         return true;
     };
+
+    const isViewingOtherUsersSessions = isAdmin && chatScope === 'all';
 
     const syncActiveSocketState = (sess: any | null = activeSession, agentId: string | undefined = id) => {
         if (!sess || !agentId) {
@@ -1242,13 +1245,28 @@ function AgentDetailInner() {
             if (currentAgentIdRef.current !== targetAgentId) return;
             if (activeSessionIdRef.current !== sess.id) return;
             const isAgentSession = sess.source_channel === 'agent' || sess.participant_type === 'agent';
-            const preParsed = msgs.map((m: any) => parseChatMsg({
+            const rawParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
             }));
+            // Group consecutive tool_call messages into _isToolGroup
+            const preParsed: any[] = [];
+            for (const m of rawParsed) {
+                if ((m as any).role === 'tool_call') {
+                    const tc = { name: (m as any).toolName || '', args: (m as any).toolArgs || {}, result: (m as any).toolResult || '' };
+                    const last = preParsed[preParsed.length - 1];
+                    if (last && (last as any)._isToolGroup) {
+                        last.toolCalls = [...(last.toolCalls || []), tc];
+                    } else {
+                        preParsed.push({ role: 'assistant', content: '', toolCalls: [tc], _isToolGroup: true });
+                    }
+                } else {
+                    preParsed.push(m);
+                }
+            }
 
             if (!isAgentSession && sess.user_id === String(currentUser?.id)) {
                 setChatMessages(preParsed);
@@ -1342,7 +1360,7 @@ function AgentDetailInner() {
         } catch (e) { alert('Failed: ' + e); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; thinking?: string; imageUrl?: string; timestamp?: string; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; thinking?: string; imageUrl?: string; timestamp?: string; _isToolGroup?: boolean; toolCalls?: { name: string; args: any; result?: string }[]; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const [liveState, setLiveState] = useState<LivePreviewState>({});
     const [livePanelVisible, setLivePanelVisible] = useState(false);
@@ -1593,15 +1611,51 @@ function AgentDetailInner() {
                     setSessionListCollapsed(true);
                     useAppStore.setState({ sidebarCollapsed: true });
                 }
-                setChatMessages(prev => {
-                    const toolMsg: ChatMsg = { role: 'tool_call', content: '', toolName: d.name, toolArgs: d.args, toolStatus: d.status, toolResult: d.result };
-                    if (d.status === 'done') {
-                        const lastIdx = prev.length - 1;
-                        const last = prev[lastIdx];
-                        if (last && last.role === 'tool_call' && last.toolName === d.name && last.toolStatus === 'running') return [...prev.slice(0, lastIdx), toolMsg];
-                    }
-                    return [...prev, toolMsg];
-                });
+                if (d.status === 'running') {
+                    setChatMessages(prev => {
+                        let msgs = [...prev];
+                        while (msgs.length > 0) {
+                            const last = msgs[msgs.length - 1];
+                            if (last.role === 'assistant' && !(last as any)._isToolGroup && !(last as any)._streaming && !(last.content && last.content.trim()) && !last.thinking) {
+                                msgs.pop();
+                            } else break;
+                        }
+                        const tc = { name: d.name, args: d.args || {} };
+                        // Find recent tool group to merge into, but stop at user messages (new turn boundary)
+                        for (let i = msgs.length - 1; i >= Math.max(0, msgs.length - 5); i--) {
+                            if (msgs[i].role === 'user') break; // New conversation turn — don't merge across
+                            if ((msgs[i] as any)._isToolGroup) {
+                                msgs[i] = { ...msgs[i], toolCalls: [...(msgs[i].toolCalls || []), tc] } as any;
+                                return msgs;
+                            }
+                        }
+                        return [...msgs, { role: 'assistant', content: '', toolCalls: [tc], _isToolGroup: true } as any];
+                    });
+                } else {
+                    setChatMessages(prev => {
+                        let msgs = [...prev];
+                        while (msgs.length > 0) {
+                            const last = msgs[msgs.length - 1];
+                            if (last.role === 'assistant' && !(last as any)._isToolGroup && !(last as any)._streaming && !(last.content && last.content.trim()) && !last.thinking) {
+                                msgs.pop();
+                            } else break;
+                        }
+                        const newCall = { name: d.name, args: d.args, result: d.result || '' };
+                        // Find recent tool group, but stop at user messages (new turn boundary)
+                        for (let i = msgs.length - 1; i >= Math.max(0, msgs.length - 5); i--) {
+                            if (msgs[i].role === 'user') break; // New conversation turn — don't merge across
+                            if ((msgs[i] as any)._isToolGroup) {
+                                const existing = (msgs[i].toolCalls || []).map((tc: any) =>
+                                    tc.name === d.name && !tc.result ? newCall : tc
+                                );
+                                const hasIt = existing.some((tc: any) => tc.name === d.name && tc.result);
+                                msgs[i] = { ...msgs[i], toolCalls: hasIt ? existing : [...existing, newCall] } as any;
+                                return msgs;
+                            }
+                        }
+                        return [...msgs, { role: 'assistant', content: '', toolCalls: [newCall], _isToolGroup: true } as any];
+                    });
+                }
             } else if (d.type === 'chunk') {
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
@@ -1668,6 +1722,7 @@ function AgentDetailInner() {
     const isNearBottom = useRef(true);
     const isFirstLoad = useRef(true);
     const [showScrollBtn, setShowScrollBtn] = useState(false);
+    const [chatScrollBtnBottom, setChatScrollBtnBottom] = useState(96);
     // Read-only history scroll-to-bottom
     const historyContainerRef = useRef<HTMLDivElement>(null);
     const [showHistoryScrollBtn, setShowHistoryScrollBtn] = useState(false);
@@ -1768,8 +1823,6 @@ function AgentDetailInner() {
             // First load: instant jump to bottom, no animation
             chatEndRef.current.scrollIntoView({ behavior: 'instant' as ScrollBehavior });
             isFirstLoad.current = false;
-            // Auto-focus the input
-            setTimeout(() => chatInputRef.current?.focus(), 100);
             return;
         }
         if (isNearBottom.current) {
@@ -1777,13 +1830,20 @@ function AgentDetailInner() {
         }
     }, [chatMessages]);
 
-    // Auto-focus input when switching sessions and connection is ready
     useEffect(() => {
-        if (activeSession && activeTab === 'chat' && wsConnected) {
-            // Tiny timeout to ensure React has enabled the textarea before focusing
-            setTimeout(() => chatInputRef.current?.focus(), 50);
-        }
-    }, [activeSession?.id, activeTab, wsConnected]);
+        const gapAboveComposer = 14;
+        const updateScrollButtonOffset = () => {
+            const composerAreaHeight = chatInputAreaRef.current?.offsetHeight ?? 82;
+            setChatScrollBtnBottom(composerAreaHeight + gapAboveComposer);
+        };
+
+        updateScrollButtonOffset();
+        if (typeof ResizeObserver === 'undefined' || !chatInputAreaRef.current) return;
+
+        const observer = new ResizeObserver(() => updateScrollButtonOffset());
+        observer.observe(chatInputAreaRef.current);
+        return () => observer.disconnect();
+    }, [activeSession?.id, activeTab]);
 
     const sendChatMsg = () => {
         if (!id || !activeSession?.id) return;
@@ -1841,6 +1901,9 @@ function AgentDetailInner() {
         }));
 
         setChatInput('');
+        if (chatInputRef.current) {
+            chatInputRef.current.style.height = 'auto';
+        }
         setAttachedFiles([]);
     };
 
@@ -3017,7 +3080,76 @@ function AgentDetailInner() {
                                                                     <div style={{ padding: '12px 0', fontSize: '12px', color: 'var(--text-tertiary)' }}>Loading...</div>
                                                                 ) : (
                                                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '8px' }}>
-                                                                        {msgs.map((msg: any, mi: number) => {
+                                                                        {msgs.filter((msg: any) => !(msg.role === 'assistant' && !msg._isToolGroup && !(msg.content && msg.content.trim()))).map((msg: any, mi: number) => {
+                                                                            if (msg._isToolGroup && msg.toolCalls?.length > 0) {
+                                                                                return (
+                                                                                    <details key={mi} style={{ borderRadius: '6px', background: 'var(--bg-secondary)', overflow: 'hidden' }}>
+                                                                                        <summary style={{
+                                                                                            padding: '5px 10px', fontSize: '11px', cursor: 'pointer',
+                                                                                            display: 'flex', alignItems: 'center', gap: '8px',
+                                                                                            listStyle: 'none', WebkitAppearance: 'none',
+                                                                                        } as any}>
+                                                                                            <span style={{ fontSize: '8px', color: 'var(--text-tertiary)', flexShrink: 0 }}>&#9654;</span>
+                                                                                            <span style={{
+                                                                                                fontWeight: 600, fontSize: '10px', color: 'var(--text-tertiary)',
+                                                                                                padding: '1px 6px', borderRadius: '3px',
+                                                                                                background: 'var(--bg-tertiary, rgba(0,0,0,0.06))',
+                                                                                                flexShrink: 0,
+                                                                                            }}>{msg.toolCalls.length} tool{msg.toolCalls.length > 1 ? 's' : ''}</span>
+                                                                                            <span style={{ display: 'flex', gap: '4px', overflow: 'hidden', flexWrap: 'nowrap' }}>
+                                                                                                {msg.toolCalls.slice(0, 4).map((tc: any, ti: number) => (
+                                                                                                    <span key={ti} style={{
+                                                                                                        fontFamily: 'monospace', fontSize: '10px', color: 'var(--text-primary)',
+                                                                                                        padding: '1px 5px', borderRadius: '3px',
+                                                                                                        background: 'var(--bg-tertiary, rgba(0,0,0,0.06))',
+                                                                                                        flexShrink: 0,
+                                                                                                    }}>{tc.name}</span>
+                                                                                                ))}
+                                                                                                {msg.toolCalls.length > 4 && <span style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>+{msg.toolCalls.length - 4}</span>}
+                                                                                            </span>
+                                                                                        </summary>
+                                                                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', padding: '6px 10px', borderTop: '1px solid var(--border-subtle)' }}>
+                                                                                            {msg.toolCalls.map((tc: any, ti: number) => {
+                                                                                                const argsStr = typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args || {}, null, 2);
+                                                                                                const resultStr = typeof tc.result === 'string' ? tc.result : JSON.stringify(tc.result || '', null, 2);
+                                                                                                return (
+                                                                                                    <details key={ti} style={{ borderRadius: '4px', background: 'var(--bg-primary, var(--bg-secondary))', overflow: 'hidden' }}>
+                                                                                                        <summary style={{
+                                                                                                            padding: '4px 8px', fontSize: '10px', cursor: 'pointer',
+                                                                                                            display: 'flex', alignItems: 'center', gap: '6px',
+                                                                                                            listStyle: 'none', WebkitAppearance: 'none',
+                                                                                                        } as any}>
+                                                                                                            <span style={{ fontSize: '7px', color: 'var(--text-tertiary)', flexShrink: 0 }}>&#9654;</span>
+                                                                                                            <span style={{
+                                                                                                                fontWeight: 600, fontFamily: 'monospace', fontSize: '10px',
+                                                                                                                color: 'var(--text-primary)', flexShrink: 0,
+                                                                                                            }}>{tc.name}</span>
+                                                                                                            <span style={{
+                                                                                                                color: 'var(--text-tertiary)', fontFamily: 'monospace', fontSize: '10px',
+                                                                                                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                                                                                            }}>{argsStr.replace(/\n/g, ' ').substring(0, 60)}{argsStr.length > 60 ? '...' : ''}</span>
+                                                                                                        </summary>
+                                                                                                        <div style={{
+                                                                                                            padding: '6px 8px', borderTop: '1px solid var(--border-subtle)',
+                                                                                                            fontFamily: 'monospace', fontSize: '10px', lineHeight: 1.5,
+                                                                                                            whiteSpace: 'pre-wrap', maxHeight: '200px', overflow: 'auto',
+                                                                                                            color: 'var(--text-secondary)',
+                                                                                                        }}>
+                                                                                                            {argsStr}
+                                                                                                            {resultStr && (
+                                                                                                                <>
+                                                                                                                    <div style={{ borderTop: '1px dashed var(--border-subtle)', margin: '6px 0', opacity: 0.5 }} />
+                                                                                                                    <span style={{ color: 'var(--text-tertiary)' }}>→ </span>{resultStr.substring(0, 500)}
+                                                                                                                </>
+                                                                                                            )}
+                                                                                                        </div>
+                                                                                                    </details>
+                                                                                                );
+                                                                                            })}
+                                                                                        </div>
+                                                                                    </details>
+                                                                                );
+                                                                            }
                                                                             if (msg.role === 'tool_call') {
                                                                                 const tName = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool';
                                                                                 const tArgs = msg.toolArgs || (() => { try { return JSON.parse(msg.content || '{}').args; } catch { return {}; } })();
@@ -3277,12 +3409,12 @@ function AgentDetailInner() {
                                                 style={{ display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}
                                                 onClick={() => setShowImportSkillModal(true)}
                                             >
-                                                Import from Presets
+                                                {t('agent.skills.importFromPresets', 'Import from Presets')}
                                             </button>
                                         </div>
                                     </div>
                                     <div style={{ marginTop: '8px', padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: '8px', fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                                        <strong>Skill Format:</strong><br />
+                                        <strong>{t('agent.skills.skillFormat', 'Skill Format:')}</strong><br />
                                         • <code>skills/my-skill/SKILL.md</code> — {t('agent.skills.folderFormat', 'Each skill is a folder with a SKILL.md file and optional auxiliary files (scripts/, examples/)')}
                                     </div>
                                 </div>
@@ -3370,11 +3502,11 @@ function AgentDetailInner() {
                                     <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setShowAgentUrlImport(false)}>
                                         <div onClick={e => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', maxWidth: '500px', width: '90%', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                                                <h3>Import from GitHub URL</h3>
+                                                <h3>{t('agent.skills.importFromGithub', 'Import from GitHub URL')}</h3>
                                                 <button onClick={() => setShowAgentUrlImport(false)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}>x</button>
                                             </div>
                                             <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '0 0 12px' }}>
-                                                Paste a GitHub URL pointing to a skill directory (must contain SKILL.md).
+                                                {t('agent.skills.githubUrlDesc', 'Paste a GitHub URL pointing to a skill directory (must contain SKILL.md).')}
                                             </p>
                                             <input
                                                 className="input"
@@ -3402,7 +3534,7 @@ function AgentDetailInner() {
                                                         }
                                                     }}
                                                 >
-                                                    {agentUrlImporting ? 'Importing...' : 'Import'}
+                                                    {agentUrlImporting ? t('agent.skills.importing', 'Importing...') : t('agent.skills.importBtn', 'Import')}
                                                 </button>
                                             </div>
                                         </div>
@@ -3414,7 +3546,7 @@ function AgentDetailInner() {
                                     <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setShowImportSkillModal(false)}>
                                         <div onClick={e => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', maxWidth: '600px', width: '90%', maxHeight: '70vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                                                <h3>📦 {t('agent.skills.importPreset', 'Import from Presets')}</h3>
+                                                <h3>{t('agent.skills.importPreset', 'Import from Presets')}</h3>
                                                 <button onClick={() => setShowImportSkillModal(false)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}>✕</button>
                                             </div>
                                             <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '0 0 16px' }}>
@@ -3469,7 +3601,7 @@ function AgentDetailInner() {
                                                                     }
                                                                 }}
                                                             >
-                                                                {importingSkillId === skill.id ? '⏳ ...' : '⬇️ Import'}
+                                                                {importingSkillId === skill.id ? t('agent.skills.importing', 'Importing...') : t('agent.skills.importBtn', 'Import')}
                                                             </button>
                                                         </div>
                                                     ))
@@ -3513,7 +3645,7 @@ function AgentDetailInner() {
                                 {/* Tab row */}
                                 <div style={{ display: 'flex', alignItems: 'center', padding: '10px 12px 0', gap: '4px', borderBottom: '1px solid var(--border-subtle)', position: 'relative' }}>
                                     {!sessionListCollapsed && (
-                                        <button onClick={() => setSessionListCollapsed(true)} className="session-sidebar-collapseBtn" style={{ position: 'absolute', top: '6px', right: '4px', zIndex: 10, background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', padding: '4px', borderRadius: '4px' }} title="Collapse sessions" onMouseEnter={e => e.currentTarget.style.background='var(--bg-secondary)'} onMouseLeave={e => e.currentTarget.style.background='none'}>
+                                        <button onClick={() => setSessionListCollapsed(true)} className="session-sidebar-collapseBtn" style={{ position: 'absolute', top: '6px', right: '4px', zIndex: 10, background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', padding: '4px', borderRadius: '4px' }} title={t('agent.chat.collapseSessions', 'Collapse sessions')} onMouseEnter={e => e.currentTarget.style.background='var(--bg-secondary)'} onMouseLeave={e => e.currentTarget.style.background='none'}>
                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
                                         </button>
                                     )}
@@ -3533,7 +3665,7 @@ function AgentDetailInner() {
                                 {chatScope === 'mine' && (
                                     <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--border-subtle)' }}>
                                         <button onClick={createNewSession}
-                                            style={{ width: '100%', padding: '5px 8px', background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', cursor: 'pointer', fontSize: '12px', color: 'var(--text-secondary)', textAlign: 'left', display: 'flex', alignItems: 'center', gap: '6px' }}
+                                            style={{ width: '100%', padding: '5px 8px', background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', cursor: 'pointer', fontSize: '12px', color: 'var(--text-secondary)', textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}
                                             onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-secondary)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
                                             onMouseLeave={e => { e.currentTarget.style.background = 'none'; e.currentTarget.style.color = 'var(--text-secondary)'; }}>
                                             + {t('agent.chat.newSession')}
@@ -3592,7 +3724,7 @@ function AgentDetailInner() {
                                                     onChange={e => setAllUserFilter(e.target.value)}
                                                     style={{ width: '100%', padding: '4px 6px', fontSize: '11px', background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)', borderRadius: '5px', color: 'var(--text-primary)', cursor: 'pointer' }}
                                                 >
-                                                    <option value="">All Users</option>
+                                                    <option value="">{t('agent.chat.allUsers', 'All Users')}</option>
                                                     {Array.from(new Set(allSessions.map((s: any) => s.username || s.user_id))).filter(Boolean).map((u: any) => (
                                                         <option key={u} value={u}>{u}</option>
                                                     ))}
@@ -3663,22 +3795,40 @@ function AgentDetailInner() {
                             <div className={`agent-chat-area ${ !!(liveState.desktop || liveState.browser || liveState.code) ? 'has-live-panel' : ''}`} style={{ flex: 1, display: 'flex', flexDirection: 'row', position: 'relative', minWidth: 0, overflow: 'hidden' }}>
                                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative', minWidth: 0, overflow: 'hidden' }}>
                                     {sessionListCollapsed && (
-                                        <button onClick={() => setSessionListCollapsed(false)} style={{ position: 'absolute', top: '12px', left: '12px', zIndex: 10, width: '28px', height: '28px', borderRadius: '6px', background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-secondary)', cursor: 'pointer', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }} title="Show chat sessions" onMouseEnter={e => e.currentTarget.style.background='var(--bg-secondary)'} onMouseLeave={e => e.currentTarget.style.background='var(--bg-elevated)'}>
+                                        <button onClick={() => setSessionListCollapsed(false)} style={{ position: 'absolute', top: '12px', left: '12px', zIndex: 10, width: '28px', height: '28px', borderRadius: '6px', background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-secondary)', cursor: 'pointer', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }} title={t('agent.chat.showSessions', 'Show chat sessions')} onMouseEnter={e => e.currentTarget.style.background='var(--bg-secondary)'} onMouseLeave={e => e.currentTarget.style.background='var(--bg-elevated)'}>
                                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
                                         </button>
                                     )}
                                 {!activeSession ? (
                                     <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '13px', flexDirection: 'column', gap: '8px' }}>
                                         <div>{t('agent.chat.noSessionSelected')}</div>
-                                        <button className="btn btn-secondary" onClick={createNewSession} style={{ fontSize: '12px' }}>{t('agent.chat.startNewSession')}</button>
+                                        {!isViewingOtherUsersSessions && (
+                                            <button className="btn btn-secondary" onClick={createNewSession} style={{ fontSize: '12px' }}>{t('agent.chat.startNewSession')}</button>
+                                        )}
                                     </div>
                                 ) : (activeSession.user_id && currentUser && activeSession.user_id !== String(currentUser.id)) || activeSession.source_channel === 'agent' || activeSession.participant_type === 'agent' ? (
                                     /* ── Read-only history view (other user's session or agent-to-agent) ── */
                                     <>
-                                        <div ref={historyContainerRef} onScroll={handleHistoryScroll} style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}>
-                                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '12px', padding: '4px 8px', background: 'var(--bg-secondary)', borderRadius: '4px', display: 'inline-block' }}>
-                                                {activeSession.source_channel === 'agent' ? `🤖 Agent Conversation · ${activeSession.username || 'Agents'}` : `Read-only · ${activeSession.username || 'User'}`}
-                                            </div>
+                                        <div
+                                            style={{
+                                                position: 'absolute',
+                                                top: '12px',
+                                                left: sessionListCollapsed ? '48px' : '16px',
+                                                zIndex: 8,
+                                                fontSize: '11px',
+                                                color: 'var(--text-tertiary)',
+                                                padding: '4px 8px',
+                                                background: 'color-mix(in srgb, var(--bg-secondary) 92%, transparent)',
+                                                border: '1px solid var(--border-subtle)',
+                                                borderRadius: '4px',
+                                                boxShadow: 'var(--shadow-sm)',
+                                                backdropFilter: 'blur(6px)',
+                                                pointerEvents: 'none',
+                                            }}
+                                        >
+                                            {activeSession.source_channel === 'agent' ? `🤖 Agent Conversation · ${activeSession.username || 'Agents'}` : `Read-only · ${activeSession.username || 'User'}`}
+                                        </div>
+                                        <div ref={historyContainerRef} onScroll={handleHistoryScroll} style={{ flex: 1, overflowY: 'auto', padding: '52px 16px 12px' }}>
                                             {(() => {
                                                 // For A2A sessions, determine which participant is "this agent" (left side)
                                                 // Use agent.name matching against sender_name from messages
@@ -3747,7 +3897,7 @@ function AgentDetailInner() {
                                             })()}
                                         </div>
                                         {showHistoryScrollBtn && (
-                                            <button onClick={scrollHistoryToBottom} style={{ position: 'absolute', bottom: '20px', right: '20px', width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', boxShadow: '0 2px 8px rgba(0,0,0,0.3)', zIndex: 10 }} title="Scroll to bottom">↓</button>
+                                            <button onClick={scrollHistoryToBottom} style={{ position: 'absolute', bottom: '20px', right: '20px', width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', boxShadow: 'var(--shadow-sm)', zIndex: 10 }} title="Scroll to bottom">↓</button>
                                         )}
                                     </>
                                 ) : (
@@ -3762,6 +3912,86 @@ function AgentDetailInner() {
                                                 </div>
                                             )}
                                             {chatMessages.map((msg, i) => {
+                                                {/* Tool call chain — grouped consecutive tool calls */}
+                                                if ((msg as any)._isToolGroup && msg.toolCalls && msg.toolCalls.length > 0) {
+                                                    return (
+                                                        <div key={i} style={{ paddingLeft: '36px', marginBottom: '6px' }}>
+                                                            <details style={{
+                                                                borderRadius: '8px',
+                                                                background: 'rgba(99,102,241,0.06)',
+                                                                border: '1px solid rgba(99,102,241,0.18)',
+                                                                fontSize: '12px',
+                                                                overflow: 'hidden',
+                                                            }}>
+                                                                <summary style={{
+                                                                    padding: '7px 10px', cursor: 'pointer',
+                                                                    display: 'flex', alignItems: 'center', gap: '6px',
+                                                                    color: 'var(--accent-text, #818cf8)',
+                                                                    userSelect: 'none', listStyle: 'none',
+                                                                }}>
+                                                                    <span style={{ fontSize: '13px' }}>🔧</span>
+                                                                    <span style={{ flex: 1, fontWeight: 500 }}>{t('agent.chat.toolCallChain')}</span>
+                                                                    <span style={{
+                                                                        background: 'rgba(99,102,241,0.18)', color: '#818cf8',
+                                                                        borderRadius: '10px', padding: '1px 7px',
+                                                                        fontSize: '10px', fontWeight: 600,
+                                                                    }}>{msg.toolCalls.length}</span>
+                                                                </summary>
+                                                                {/* Collapsed: tool name pills */}
+                                                                <div style={{ padding: '0 10px 7px 10px', display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                                                                    {msg.toolCalls.map((tc: any, j: number) => (
+                                                                        <span key={j} style={{
+                                                                            background: 'rgba(99,102,241,0.10)',
+                                                                            border: '1px solid rgba(99,102,241,0.15)',
+                                                                            borderRadius: '4px', padding: '1px 6px',
+                                                                            fontSize: '10px', color: '#a5b4fc',
+                                                                            fontFamily: 'var(--font-mono)',
+                                                                        }}>{tc.name}</span>
+                                                                    ))}
+                                                                </div>
+                                                                {/* Expanded: each tool's details */}
+                                                                <div style={{ borderTop: '1px solid rgba(99,102,241,0.15)' }}>
+                                                                    {msg.toolCalls.map((tc: any, j: number) => (
+                                                                        <details key={j} style={{
+                                                                            borderBottom: j < msg.toolCalls!.length - 1 ? '1px solid rgba(99,102,241,0.10)' : 'none',
+                                                                        }}>
+                                                                            <summary style={{
+                                                                                padding: '6px 10px', cursor: 'pointer',
+                                                                                display: 'flex', alignItems: 'center', gap: '5px',
+                                                                                userSelect: 'none', listStyle: 'none', fontSize: '11px',
+                                                                            }}>
+                                                                                <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: tc.result ? '#818cf8' : '#f59e0b', flexShrink: 0 }} />
+                                                                                <span style={{ fontFamily: 'var(--font-mono)', color: '#818cf8', fontWeight: 600 }}>{tc.name}</span>
+                                                                                {!tc.result && <span style={{ color: 'var(--text-tertiary)', fontSize: '10px', marginLeft: 'auto' }}>{t('common.loading')}</span>}
+                                                                            </summary>
+                                                                            <div style={{ padding: '0 10px 6px 10px' }}>
+                                                                                {tc.args && Object.keys(tc.args).length > 0 && (
+                                                                                    <div style={{
+                                                                                        fontFamily: 'var(--font-mono)', fontSize: '10px',
+                                                                                        color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap',
+                                                                                        wordBreak: 'break-all', maxHeight: '80px', overflowY: 'auto',
+                                                                                        background: 'rgba(0,0,0,0.12)', borderRadius: '4px',
+                                                                                        padding: '4px 6px', marginBottom: tc.result ? '4px' : 0,
+                                                                                    }}>{JSON.stringify(tc.args, null, 2)}</div>
+                                                                                )}
+                                                                                {tc.result && (
+                                                                                    <div style={{
+                                                                                        fontSize: '10px', color: 'var(--text-secondary)',
+                                                                                        whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                                                                                        maxHeight: '120px', overflowY: 'auto',
+                                                                                        background: 'rgba(0,0,0,0.08)', borderRadius: '4px',
+                                                                                        padding: '4px 6px',
+                                                                                    }}>{tc.result.length > 500 ? tc.result.slice(0, 500) + '…' : tc.result}</div>
+                                                                                )}
+                                                                            </div>
+                                                                        </details>
+                                                                    ))}
+                                                                </div>
+                                                            </details>
+                                                        </div>
+                                                    );
+                                                }
+                                                {/* Legacy individual tool_call (fallback) */}
                                                 if (msg.role === 'tool_call') {
                                                     return (
                                                         <div key={i} style={{ display: 'flex', gap: '8px', marginBottom: '6px', paddingLeft: '36px', minWidth: 0 }}>
@@ -3778,7 +4008,7 @@ function AgentDetailInner() {
                                                     );
                                                 }
                                                 {/* Assistant message with no text content: show inline thinking or skip */ }
-                                                if (msg.role === 'assistant' && !msg.content?.trim()) {
+                                                if (msg.role === 'assistant' && !(msg as any)._isToolGroup && !msg.content?.trim()) {
                                                     if (msg.thinking) {
                                                         return (
                                                             <div key={i} style={{ paddingLeft: '36px', marginBottom: '6px' }}>
@@ -3825,7 +4055,7 @@ function AgentDetailInner() {
                                             <div ref={chatEndRef} />
                                         </div>
                                         {showScrollBtn && (
-                                            <button onClick={scrollToBottom} style={{ position: 'absolute', bottom: '70px', right: '20px', width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', boxShadow: '0 2px 8px rgba(0,0,0,0.3)', zIndex: 10 }} title="Scroll to bottom">↓</button>
+                                            <button onClick={scrollToBottom} style={{ position: 'absolute', bottom: `${chatScrollBtnBottom}px`, right: '20px', width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', boxShadow: 'var(--shadow-sm)', zIndex: 10 }} title="Scroll to bottom">↓</button>
                                         )}
                                         {agentExpired ? (
                                             <div style={{ padding: '7px 16px', borderTop: '1px solid rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.08)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'rgb(180,100,0)' }}>
@@ -3838,7 +4068,7 @@ function AgentDetailInner() {
                                                 Connecting...
                                             </div>
                                         ) : null}
-                                        <div className="chat-input-area" style={{ flexShrink: 0 }}>
+                                        <div ref={chatInputAreaRef} className="chat-input-area" style={{ flexShrink: 0 }}>
                                             <div className="chat-composer">
                                             {(chatUploadDrafts.length > 0 || attachedFiles.length > 0) && (
                                                 <div className="chat-composer-attachments">
@@ -3901,7 +4131,12 @@ function AgentDetailInner() {
                                                     ref={chatInputRef}
                                                     className="chat-input"
                                                     value={chatInput}
-                                                    onChange={e => setChatInput(e.target.value)}
+                                                    onChange={e => {
+                                                        setChatInput(e.target.value);
+                                                        const el = e.target;
+                                                        el.style.height = 'auto';
+                                                        el.style.height = el.scrollHeight + 'px';
+                                                    }}
                                                     onKeyDown={e => {
                                                         // Enter sends the message; Shift+Enter inserts a newline
                                                         if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isWaiting && !isStreaming) {
@@ -3913,7 +4148,6 @@ function AgentDetailInner() {
                                                     placeholder={!wsConnected && (!activeSession?.user_id || !currentUser || activeSession.user_id === String(currentUser?.id)) ? 'Connecting...' : t('chat.placeholder')}
                                                     disabled={!wsConnected}
                                                     rows={1}
-                                                    autoFocus
                                                 />
                                             </div>
                                             <div className="chat-composer-toolbar">
