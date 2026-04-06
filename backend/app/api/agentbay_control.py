@@ -8,6 +8,7 @@ prevent human-agent input collisions.
 Cookie export occurs automatically when the Take Control session ends.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -40,6 +41,19 @@ _LOCK_TIMEOUT_SECONDS = 600  # Auto-expire stale locks after 10 minutes
 # Cache of sessions that have already had browser initialization called.
 # Avoids redundant _ensure_browser_initialized() on every screenshot poll.
 _browser_initialized: set[tuple] = set()
+
+# Per-session interaction locks to serialize concurrent TC interactions.
+# Without this, two rapid clicks both write tc_action.js simultaneously,
+# corrupting one script's execution. Each TC session gets its own Lock.
+_tc_interaction_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_interaction_lock(agent_id: uuid.UUID, session_id: str) -> asyncio.Lock:
+    """Get or create the per-session asyncio.Lock for TC interactions."""
+    key = f"{agent_id}:{session_id}"
+    if key not in _tc_interaction_locks:
+        _tc_interaction_locks[key] = asyncio.Lock()
+    return _tc_interaction_locks[key]
 
 
 def is_session_locked(agent_id: str, session_id: str) -> bool:
@@ -248,11 +262,19 @@ async def _eval_cdp_script(client, script_body: str) -> dict:
 
 
 async def _tc_browser_cleanup(agent_id: uuid.UUID, session_id: str) -> None:
-    """Best-effort CDP cleanup run immediately after Take Control exits.
+    """Best-effort cleanup immediately after Take Control exits.
 
-    Cancels any pending navigation and releases held mouse buttons so Chrome
-    is in a stable, known-good state before the AgentBay SDK's browser.operator
-    takes back control. All failures are intentionally swallowed.
+    Uses the AgentBay SDK's own browser.operator.navigate() to navigate to
+    about:blank. This goes through the SERVICE'S Playwright instance (not a
+    new connectOverCDP connection), so there's no competing CDP session,
+    no Target.attachToTarget/detachFromTarget events, and no risk of confusing
+    the service's internal page state.
+
+    IMPORTANT: Previous approaches that used connectOverCDP + browser.close()
+    for cleanup were sending Target.detachFromTarget events to Chrome while
+    navigation was in progress. The AgentBay service's Playwright received
+    these detach events mid-navigation, which put its internal state machine
+    into a 60-second recovery loop before it could accept the next page.goto().
     """
     from app.services.agentbay_client import _agentbay_sessions
 
@@ -265,38 +287,75 @@ async def _tc_browser_cleanup(agent_id: uuid.UUID, session_id: str) -> None:
     if not cleanup_client:
         return
 
-    # Cancel any pending navigation and release mouse buttons so Chrome is in a
-    # clean, stable state before the AgentBay SDK's browser.operator resumes.
-    # NOTE: We intentionally do NOT navigate to about:blank here — doing so can
-    # pollute the page list so subsequent TC sessions pick the wrong page via
-    # context.pages()[0].
-    cleanup_script = """
+    try:
+        # Cleanup strategy: stop all in-flight page navigations, then navigate
+        # the active content page to about:blank.
+        #
+        # WHY multi-step:
+        # 1. stopLoading on all pages: a TC click may have opened a NEW TAB
+        #    (target=_blank link on baidu) that is still loading a heavy article.
+        #    Page.stopLoading kills that load immediately so Chrome's DevTools
+        #    is no longer blocked draining a multi-MB response.
+        # 2. Page.navigate to about:blank on the active page: gives the AgentBay
+        #    service's page.goto() a clean starting point. about:blank commits in
+        #    <10ms; the service no longer has to wait for tieba/zhihu/baidu to drain.
+        # 3. Wait for Page.loadEventFired before process.exit(): ensures Chrome has
+        #    fully settled at about:blank before we disconnect. This means Chrome
+        #    emits Target.detachedFromTarget (from our WebSocket close) while the
+        #    page is in a stable, loaded state — not mid-navigation — so the
+        #    service's Playwright state machine doesn't enter a 60-second recovery.
+        # 4. No browser.close(): we let Node.js exit naturally. Chrome handles
+        #    the WebSocket close without an explicit Target.detachFromTarget CDP
+        #    command that races with other async CDP events.
+        cleanup_script = """
 const { chromium } = require('/usr/local/lib/node_modules/playwright');
-let browser;
 (async () => {
     try {
-        browser = await chromium.connectOverCDP('http://localhost:9222');
+        const browser = await chromium.connectOverCDP('http://localhost:9222');
         const context = browser.contexts()[0];
-        const pages = context.pages();
-        const page = pages.slice().reverse().find(p => p.url() !== 'about:blank') || pages[pages.length - 1];
-        // Stop any pending navigation left from TC interactions
-        try { await page.evaluate(() => window.stop()); } catch(e) {}
-        // Release any mouse buttons that may have been left pressed
-        try { await page.mouse.up(); } catch(e) {}
+        const allPages = context.pages();
+
+        // Stop all loading pages so Chrome is not draining heavy responses.
+        // tc clicks frequently open new tabs (target=_blank) that stay loading
+        // for 20-40s; stopping them is critical for fast post-TC recovery.
+        for (const p of allPages) {
+            try {
+                const cdp = await context.newCDPSession(p);
+                await cdp.send('Page.stopLoading');
+                await cdp.detach();
+            } catch(_) {}
+        }
+
+        // Navigate the active content page (last non-blank) to about:blank.
+        // Use raw CDP Page.navigate — the AgentBay SDK rejects about:blank
+        // ("must start with http or https") but Chrome's CDP has no such rule.
+        const contentPage = allPages.slice().reverse().find(p => p.url() !== 'about:blank')
+                            || allPages[allPages.length - 1];
+        const cdp = await context.newCDPSession(contentPage);
+
+        // Navigate and wait for loadEventFired so about:blank is fully settled.
+        await new Promise((resolve) => {
+            cdp.on('Page.loadEventFired', () => resolve());
+            cdp.send('Page.navigate', { url: 'about:blank' }).catch(() => resolve());
+            setTimeout(resolve, 800);  // Fallback: about:blank always loads in <100ms
+        });
+
         console.log('CLEANUP_OK');
     } catch(e) {
         console.error('CLEANUP_FAIL: ' + e.message);
-    } finally {
-        if (browser) await browser.close().catch(() => {});
     }
+    // No browser.close() — let Chrome handle WebSocket close gracefully after
+    // the page is in a stable loaded state (about:blank).
     process.exit(0);
 })();
 """
-    try:
         res = await _eval_cdp_script(cleanup_client, cleanup_script)
-        logger.info(f"[TakeControl] Post-unlock CDP cleanup: {res.get('output', '')[:100]}")
+        logger.info(
+            f"[TakeControl] Cleanup: {res.get('output', 'no output')[:100]} "
+            f"for session={session_id[:8]}"
+        )
     except Exception as e:
-        logger.warning(f"[TakeControl] Post-unlock CDP cleanup failed (non-fatal): {e}")
+        logger.warning(f"[TakeControl] Cleanup failed (non-fatal): {e}")
 
 
 async def _perform_click(client, x: int, y: int, button: str = "left"):
@@ -313,25 +372,46 @@ async def _perform_click(client, x: int, y: int, button: str = "left"):
     if _is_browser_session(client):
         script = f"""
 const {{ chromium }} = require('/usr/local/lib/node_modules/playwright');
-let browser;
 (async () => {{
     let ok = false;
     try {{
-        browser = await chromium.connectOverCDP('http://localhost:9222');
+        const browser = await chromium.connectOverCDP('http://localhost:9222');
         const context = browser.contexts()[0];
-        // Pick the last non-blank page so we always target the visible content page.
-        // pages()[0] may be about:blank if a previous TC session left stale state.
         const pages = context.pages();
-        const page = pages.slice().reverse().find(p => p.url() !== 'about:blank') || pages[pages.length - 1];
-        console.log('TARGET_PAGE:' + page.url());
+
+        // Page selection: prefer the last page with a committed non-blank URL.
+        // When a tc click opens a new tab (target=_blank), the new tab briefly
+        // has url() === 'about:blank' before its navigation commits. During that
+        // window, we correctly target the ORIGINAL content page (the one the user
+        // sees in the TC screenshot). The NEXT click, after the new tab has settled,
+        // will naturally pick the new tab because its URL will be non-blank by then.
+        const page = pages.slice().reverse().find(p => p.url() !== 'about:blank')
+                     || pages[pages.length - 1];
+        const initialUrl = page.url();
+        const initialPageCount = pages.length;
+        console.log('TARGET_PAGE:' + initialUrl);
+
         await page.mouse.click({x}, {y}, {{ button: '{button}' }});
         console.log('CLICK_OK');
         ok = true;
+
+        // Wait 2 seconds for any triggered navigation to commit before releasing
+        // the interaction lock. This covers both cases:
+        //   A) Same-tab navigation: URL commits in ~0.5-1s
+        //   B) New-tab navigation (target=_blank): new tab URL transitions from
+        //      about:blank to the target URL in ~1-2s
+        //
+        // WHY a fixed sleep instead of polling context.pages() every 200ms:
+        // Polling makes ~20 CDP calls while Chrome is loading a heavy new tab.
+        // Under that combined load, Chrome's DevTools HTTP server stops responding,
+        // causing the NEXT connectOverCDP to time out with a 30-second error.
+        // A passive sleep has zero CDP overhead and achieves the same goal.
+        await new Promise(r => setTimeout(r, 2000));
     }} catch (e) {{
         console.error('CLICK_FAIL:' + e.message);
-    }} finally {{
-        if (browser) await browser.close().catch(() => {{}});
     }}
+    // No browser.close() — avoid explicit Target.detachFromTarget.
+    // Chrome handles the WebSocket close gracefully.
     process.exit(ok ? 0 : 1);
 }})();
 """
@@ -366,11 +446,10 @@ async def _perform_type(client, text: str):
         encoded_text = urllib.parse.quote(text)
         script = f"""
 const {{ chromium }} = require('/usr/local/lib/node_modules/playwright');
-let browser;
 (async () => {{
     let ok = false;
     try {{
-        browser = await chromium.connectOverCDP('http://localhost:9222');
+        const browser = await chromium.connectOverCDP('http://localhost:9222');
         const context = browser.contexts()[0];
         const pages = context.pages();
         const page = pages.slice().reverse().find(p => p.url() !== 'about:blank') || pages[pages.length - 1];
@@ -380,9 +459,8 @@ let browser;
         ok = true;
     }} catch (e) {{
         console.error('TYPE_FAIL:' + e.message);
-    }} finally {{
-        if (browser) await browser.close().catch(() => {{}});
     }}
+    // No browser.close() — avoid Target.detachFromTarget mid-navigation.
     process.exit(ok ? 0 : 1);
 }})();
 """
@@ -421,11 +499,10 @@ async def _perform_press_keys(client, keys: list[str]):
         combined = "+".join(playwright_keys)
         script = f"""
 const {{ chromium }} = require('/usr/local/lib/node_modules/playwright');
-let browser;
 (async () => {{
     let ok = false;
     try {{
-        browser = await chromium.connectOverCDP('http://localhost:9222');
+        const browser = await chromium.connectOverCDP('http://localhost:9222');
         const context = browser.contexts()[0];
         const pages = context.pages();
         const page = pages.slice().reverse().find(p => p.url() !== 'about:blank') || pages[pages.length - 1];
@@ -434,9 +511,8 @@ let browser;
         ok = true;
     }} catch (e) {{
         console.error('PRESS_FAIL:' + e.message);
-    }} finally {{
-        if (browser) await browser.close().catch(() => {{}});
     }}
+    // No browser.close() — avoid Target.detachFromTarget mid-navigation.
     process.exit(ok ? 0 : 1);
 }})();
 """
@@ -511,9 +587,8 @@ let browser;
         ok = true;
     }} catch (e) {{
         console.error('TC_FAIL: ' + e.message);
-    }} finally {{
-        if (browser) await browser.close().catch(() => {{}});
     }}
+    // No browser.close() — avoid Target.detachFromTarget mid-navigation.
     process.exit(ok ? 0 : 1);
 }})();
 """
@@ -601,16 +676,19 @@ async def control_click(
         raise HTTPException(status_code=400, detail="Session is not in Take Control mode")
 
     client = await _get_client(agent_id, data.session_id)
-    try:
-        result = await _perform_click(client, data.x, data.y, data.button)
-        if result.get("success"):
-            return {"status": "ok", "detail": f"Clicked at ({data.x}, {data.y})"}
-        else:
-            detail = result.get("stderr") or result.get("output") or "Click operation failed"
-            return {"status": "error", "detail": detail[:500]}
-    except Exception as e:
-        logger.error(f"[TakeControl] Click exception: {e}")
-        return {"status": "error", "detail": str(e)[:500]}
+    # Serialize interactions per-session: rapid clicks would otherwise overwrite
+    # tc_action.js concurrently, causing the second script to read wrong content.
+    async with _get_interaction_lock(agent_id, data.session_id):
+        try:
+            result = await _perform_click(client, data.x, data.y, data.button)
+            if result.get("success"):
+                return {"status": "ok", "detail": f"Clicked at ({data.x}, {data.y})"}
+            else:
+                detail = result.get("stderr") or result.get("output") or "Click operation failed"
+                return {"status": "error", "detail": detail[:500]}
+        except Exception as e:
+            logger.error(f"[TakeControl] Click exception: {e}")
+            return {"status": "error", "detail": str(e)[:500]}
 
 
 @router.post("/type")
@@ -626,16 +704,17 @@ async def control_type(
         raise HTTPException(status_code=400, detail="Session is not in Take Control mode")
 
     client = await _get_client(agent_id, data.session_id)
-    try:
-        result = await _perform_type(client, data.text)
-        if result.get("success"):
-            return {"status": "ok", "detail": "Text sent"}
-        else:
-            detail = result.get("stderr") or result.get("output") or "Type operation failed"
-            return {"status": "error", "detail": detail[:500]}
-    except Exception as e:
-        logger.error(f"[TakeControl] Type exception: {e}")
-        return {"status": "error", "detail": str(e)[:500]}
+    async with _get_interaction_lock(agent_id, data.session_id):
+        try:
+            result = await _perform_type(client, data.text)
+            if result.get("success"):
+                return {"status": "ok", "detail": "Text sent"}
+            else:
+                detail = result.get("stderr") or result.get("output") or "Type operation failed"
+                return {"status": "error", "detail": detail[:500]}
+        except Exception as e:
+            logger.error(f"[TakeControl] Type exception: {e}")
+            return {"status": "error", "detail": str(e)[:500]}
 
 
 @router.post("/press_keys")
@@ -651,16 +730,17 @@ async def control_press_keys(
         raise HTTPException(status_code=400, detail="Session is not in Take Control mode")
 
     client = await _get_client(agent_id, data.session_id)
-    try:
-        result = await _perform_press_keys(client, data.keys)
-        if result.get("success"):
-            return {"status": "ok", "detail": f"Pressed: {'+'.join(data.keys)}"}
-        else:
-            detail = result.get("stderr") or result.get("output") or "Key press failed"
-            return {"status": "error", "detail": detail[:500]}
-    except Exception as e:
-        logger.error(f"[TakeControl] Press keys exception: {e}")
-        return {"status": "error", "detail": str(e)[:500]}
+    async with _get_interaction_lock(agent_id, data.session_id):
+        try:
+            result = await _perform_press_keys(client, data.keys)
+            if result.get("success"):
+                return {"status": "ok", "detail": f"Pressed: {'+'.join(data.keys)}"}
+            else:
+                detail = result.get("stderr") or result.get("output") or "Key press failed"
+                return {"status": "error", "detail": detail[:500]}
+        except Exception as e:
+            logger.error(f"[TakeControl] Press keys exception: {e}")
+            return {"status": "error", "detail": str(e)[:500]}
 
 
 @router.post("/drag")
@@ -681,20 +761,21 @@ async def control_drag(
         raise HTTPException(status_code=400, detail="Session is not in Take Control mode")
 
     client = await _get_client(agent_id, data.session_id)
-    try:
-        result = await _perform_drag(
-            client,
-            data.from_x, data.from_y,
-            data.to_x, data.to_y,
-            data.duration_ms,
-        )
-        if result.get("success"):
-            return {"status": "ok", "detail": result.get("output", "Drag complete")}
-        else:
-            return {"status": "error", "detail": result.get("output", "Drag failed")[:500]}
-    except Exception as e:
-        logger.error(f"[TakeControl] Drag exception: {e}")
-        return {"status": "error", "detail": str(e)[:500]}
+    async with _get_interaction_lock(agent_id, data.session_id):
+        try:
+            result = await _perform_drag(
+                client,
+                data.from_x, data.from_y,
+                data.to_x, data.to_y,
+                data.duration_ms,
+            )
+            if result.get("success"):
+                return {"status": "ok", "detail": result.get("output", "Drag complete")}
+            else:
+                return {"status": "error", "detail": result.get("output", "Drag failed")[:500]}
+        except Exception as e:
+            logger.error(f"[TakeControl] Drag exception: {e}")
+            return {"status": "error", "detail": str(e)[:500]}
 
 
 @router.post("/screenshot")
