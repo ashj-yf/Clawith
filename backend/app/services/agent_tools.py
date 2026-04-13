@@ -4805,13 +4805,13 @@ async def _append_focus_item(agent_id: uuid.UUID, identifier: str, description: 
         logger.warning(f"[A2A] Failed to update focus.md for agent {agent_id}: {e}")
 
 
-async def _wake_agent_async(agent_id: uuid.UUID, reason_context: str, *, from_agent_id: uuid.UUID | None = None, skip_dedup: bool = False) -> None:
+async def _wake_agent_async(agent_id: uuid.UUID, reason_context: str, *, from_agent_id: uuid.UUID | None = None, skip_dedup: bool = False, a2a_session_id: str | None = None) -> None:
     """Wake an agent asynchronously via the trigger invocation path.
 
     Delegates to the public wake_agent_with_context API in trigger_daemon.
     """
     from app.services.trigger_daemon import wake_agent_with_context
-    await wake_agent_with_context(agent_id, reason_context, from_agent_id=from_agent_id, skip_dedup=skip_dedup)
+    await wake_agent_with_context(agent_id, reason_context, from_agent_id=from_agent_id, skip_dedup=skip_dedup, a2a_session_id=a2a_session_id)
 
 
 async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
@@ -5005,6 +5005,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                         f"[From {source_name}] {message_text}",
                         from_agent_id=from_agent_id,
                         skip_dedup=True,
+                        a2a_session_id=session_id,
                     )
                 except Exception as e:
                     logger.warning(f"[A2A] Failed to wake {target.name} for notify: {e}")
@@ -5064,6 +5065,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                         f"[From {source_name}] {message_text}",
                         from_agent_id=from_agent_id,
                         skip_dedup=True,
+                        a2a_session_id=session_id,
                     )
                 except Exception as e:
                     logger.warning(f"[A2A] Failed to wake {target.name} for delegate: {e}")
@@ -5130,6 +5132,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 get_provider_base_url,
                 create_llm_client,
                 LLMMessage,
+                get_model_api_key,
             )
             from app.services.llm_client import LLMError
             from app.services.agent_tools import get_agent_tools_for_llm, execute_tool
@@ -5152,7 +5155,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
             llm_client = create_llm_client(
                 provider=target_model.provider,
-                api_key=target_model.api_key_encrypted,
+                api_key=get_model_api_key(target_model),
                 model=target_model.model,
                 base_url=base_url,
                 timeout=float(getattr(target_model, 'request_timeout', None) or 120.0),
